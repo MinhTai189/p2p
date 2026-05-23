@@ -14,7 +14,8 @@ const MAX_SINGLE_TRANS_AMOUNT = Number(process.env.MAX_SINGLE_TRANS_AMOUNT) || I
 const TRACKING_INTERVAL_MIN = Number(process.env.TRACKING_INTERVAL_MIN) || 5; 
 const TRACKING_WINDOW_MIN = Number(process.env.TRACKING_WINDOW_MIN) || 30;   
 
-const MONITOR_INTERVAL_MS = TRACKING_INTERVAL_MIN * 60 * 1000;       
+// CRITICAL FIX: Changed back to your strict 1-minute execution interval
+const MONITOR_INTERVAL_MS = Number(process.env.MONITOR_INTERVAL_MIN) * 60 * 1000;       
 const SUMMARY_INTERVAL_MS = (Number(process.env.SUMMARY_INTERVAL_MIN) || 10) * 60 * 1000;  
 const MAX_HISTORY_WINDOW_MS = TRACKING_WINDOW_MIN * 60 * 1000; 
 
@@ -29,6 +30,10 @@ const MAX_ALERTS_PER_AD = 3;
 
 // Tracker to prevent FnG alert spamming (tracks by daily timestamp provided by the API)
 const fngAlertTracker = new Set();
+
+// Gating state to prevent rate-limiting on the daily-updating FnG API endpoint
+let lastFngFetchDate = '';
+let cachedFngData = null;
 
 /**
  * Historical Data Cache Map
@@ -87,15 +92,11 @@ async function fetchP2POrderBook(tradeType = "BUY") {
 
 /**
  * Calculates the average of the 5 highest sell prices matching your wallet limits.
- * Note: When tradeType is "SELL" on Binance P2P, you are looking at ads from buyers 
- * who want to purchase your crypto. The prices are already sorted descending 
- * (highest payout first).
  */
 async function calculateHighestSellPrice() {
   const sellAds = await fetchP2POrderBook("SELL");
   if (!sellAds || sellAds.length === 0) return null;
 
-  // Extract prices from the top 5 ads (or fewer if less than 5 match filters)
   const targetBatch = sellAds.slice(0, 5);
   const totalSum = targetBatch.reduce((sum, entry) => sum + parseFloat(entry.adv.price), 0);
   
@@ -103,20 +104,29 @@ async function calculateHighestSellPrice() {
 }
 
 async function fetchFearAndGreedData() {
+  const todayUtc = new Date().toISOString().split('T')[0];
+  
+  // Only call the external API if the date changed or we don't have cache yet
+  if (lastFngFetchDate === todayUtc && cachedFngData) {
+    return cachedFngData;
+  }
+
   try {
     const response = await axios.get(FEAR_GREED_URL, { timeout: 5000 });
     const currentData = response?.data?.data?.[0];
     if (currentData) {
-      return { 
+      cachedFngData = { 
         value: Number(currentData.value), 
         classification: currentData.value_classification,
         timestamp: currentData.timestamp 
       };
+      lastFngFetchDate = todayUtc;
+      return cachedFngData;
     }
-    return null;
+    return cachedFngData; // Fallback to cache if API errors out
   } catch (error) {
     console.error('❌ Fear & Greed API Error:', error.message);
-    return null;
+    return cachedFngData; 
   }
 }
 
@@ -205,7 +215,6 @@ function runDynamicQuantEngine(fngValue, currentP2PPrice, btc, eth, bnb, sol) {
   const actions = [];
   let marketContext = "Stable Consolidation";
 
-  // P2P Premium/Discount Index vs Global Banking Spot Estimates 
   const IMPLIED_GLOBAL_USD_VND = 25420; 
   if (currentP2PPrice) {
     const premiumRatio = ((currentP2PPrice / IMPLIED_GLOBAL_USD_VND) - 1) * 100;
@@ -219,14 +228,12 @@ function runDynamicQuantEngine(fngValue, currentP2PPrice, btc, eth, bnb, sol) {
     }
   }
 
-  // Macro Sentiment Velocity
   if (fngValue < 25) {
     actions.push(`📉 **MACRO VELOCITY (FnG ${fngValue} - EXTREME FEAR):** Deep historical value window. Market sentiment indicates severe panic. Mathematical historical data heavily favors systematic Spot dollar-cost averaging (DCA) over chasing high-velocity breakouts.`);
   } else if (fngValue >= 80) {
     actions.push(`🚨 **MACRO SATURATION (FnG ${fngValue} - EXTREME GREED):** Market risks overextension. Dynamic velocity exhaustion is imminent; secure profit targets and protect liquid capital reserves.`);
   }
 
-  // Mathematical Rotation Matrix (Relative Strength Coefficients)
   if (btc && eth && sol) {
     const ethVsBtcSpread = eth.rawChange - btc.rawChange;
     const solVsBtcSpread = sol.rawChange - btc.rawChange;
@@ -280,7 +287,6 @@ async function monitorThreshold() {
       if (fngValue < 25 && !fngAlertTracker.has(fngTimestamp)) {
         fngAlertTracker.add(fngTimestamp);
         
-        // Fetch and calculate the top 5 sell average
         const avgSellPrice = await calculateHighestSellPrice();
         const sellPriceText = avgSellPrice 
           ? `**${avgSellPrice.toLocaleString('en-US', { maximumFractionDigits: 2 })} VND** (Avg of top 5)` 
@@ -299,7 +305,6 @@ async function monitorThreshold() {
       }
     }
 
-    // Force pull spot ticker definitions into tracking buffers every monitoring interval loop execution
     await Promise.all([
       fetchSpotTickerData('BTCUSDT'),
       fetchSpotTickerData('ETHUSDT'),
@@ -310,7 +315,6 @@ async function monitorThreshold() {
     const adList = await fetchP2POrderBook("BUY");
     if (!adList || adList.length === 0) return;
 
-    // Filter ad listings based on single transaction amount specifications
     const filteredAds = adList.filter(entry => {
       const minTrans = Number(entry.adv.minSingleTransAmount);
       const maxTrans = Number(entry.adv.maxSingleTransAmount);
@@ -322,7 +326,6 @@ async function monitorThreshold() {
       return;
     }
 
-    // Cache the best matching ad structure
     const topAd = filteredAds[0];
     lastKnownMarketData = {
       price: parseFloat(topAd.adv.price),
@@ -334,7 +337,6 @@ async function monitorThreshold() {
     const fngValueText = fngData ? `${fngData.value} (${fngData.classification})` : 'Data Unavailable';
     console.log(`[${new Date().toLocaleTimeString()}] Audit -> Best P2P Buy: ${lastKnownMarketData.price} VND | FnG: ${fngValueText}`);
 
-    // Process price target matches
     for (const entry of filteredAds) {
       const price = parseFloat(entry.adv.price);
       const merchant = entry.advertiser.nickName;
@@ -414,7 +416,7 @@ async function sendInstantSummary() {
     if (marketData) {
       const formattedMin = Number(marketData.minSingleTransAmount).toLocaleString('en-US');
       const formattedMax = Number(marketData.maxSingleTransAmount).toLocaleString('en-US');
-      p2pBuyText = `**${marketData.price} VND** (User: ${marketData.merchant})\n> ⚖️ **Ad Range Limits:** ${formattedMin} - ${formattedMax} VND`;
+      p2pBuyText = `**${marketData.price} VND** (User: ${marketData.merchant})\n> ⚖ *Ad Range Limits:* ${formattedMin} - ${formattedMax} VND`;
     }
 
     const sellPriceText = avgSellPrice 
@@ -477,7 +479,6 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, () => {
   console.log(`🚀 Server executing tracking workflows on port ${PORT}`);
   
-  // Initial execution
   monitorThreshold();
   
   const monitorId = setInterval(monitorThreshold, MONITOR_INTERVAL_MS);
