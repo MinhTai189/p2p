@@ -2,126 +2,215 @@ const axios = require('axios');
 const http = require('http');
 require('dotenv').config();
 
+// --- Configuration Parsing ---
 const PORT = process.env.PORT || 3000;
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 const TARGET_PRICE = Number(process.env.TARGET_PRICE) || 26300;
 
-// Filter environment parameters
 const MIN_SINGLE_TRANS_AMOUNT = Number(process.env.MIN_SINGLE_TRANS_AMOUNT) || 0;
 const MAX_SINGLE_TRANS_AMOUNT = Number(process.env.MAX_SINGLE_TRANS_AMOUNT) || Infinity;
 
-const MONITOR_INTERVAL_MS = (Number(process.env.MONITOR_INTERVAL_MIN) || 1) * 60 * 1000;       
-const SUMMARY_INTERVAL_MS = (Number(process.env.SUMMARY_INTERVAL_MIN) || 10) * 60 * 1000;  
+// Dynamic lookback tracking variables
+const TRACKING_INTERVAL_MIN = Number(process.env.TRACKING_INTERVAL_MIN) || 5; 
+const TRACKING_WINDOW_MIN = Number(process.env.TRACKING_WINDOW_MIN) || 30;   
 
+const MONITOR_INTERVAL_MS = TRACKING_INTERVAL_MIN * 60 * 1000;       
+const SUMMARY_INTERVAL_MS = (Number(process.env.SUMMARY_INTERVAL_MIN) || 10) * 60 * 1000;  
+const MAX_HISTORY_WINDOW_MS = TRACKING_WINDOW_MIN * 60 * 1000; 
+
+// --- Constants & State Trackers ---
 const BINANCE_P2P_URL = 'https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search';
 const FEAR_GREED_URL = 'https://api.alternative.me/fng/';
 const BINANCE_24HR_TICKER_URL = 'https://api.binance.com/api/v3/ticker/24hr';
 
-// Global memory state
 let lastKnownMarketData = null;
 const adNotificationTracker = new Map(); 
 const MAX_ALERTS_PER_AD = 3;
-
-// Tracker to prevent FnG alert spamming (tracks by daily timestamp provided by the API)
 const fngAlertTracker = new Set();
 
+// Holds historical data points per asset symbol
+const priceHistoryLog = new Map();
+
 /**
- * Robust fetcher wrapper with Exponential Backoff
+ * Global utility to fetch resources with retry fallback loops
  */
-async function fetchWithRetry(url, data, headers, retries = 3, delay = 2000) {
-  try {
-    return await axios.post(url, data, { headers, timeout: 8000 });
-  } catch (error) {
-    if (error.response?.status === 429 && retries > 0) {
-      console.warn(`⚠️ [429 Throttled] Binance rate limit hit. Retrying in ${delay / 1000}s... (${retries} attempts left)`);
-      await new Promise(resolve => setTimeout(resolve, delay));
-      return fetchWithRetry(url, data, headers, retries - 1, delay * 2);
+async function fetchWithRetry(url, options = {}, retries = 3, delay = 2000) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await axios({ url, ...options });
+    } catch (err) {
+      if (i === retries - 1) throw err;
+      await new Promise(res => setTimeout(res, delay));
     }
-    throw error;
   }
 }
 
 /**
- * Fetch active P2P ads (Refactored to accept dynamic tradeType inputs)
+ * Crawls Binance P2P Ad Books
  */
-async function fetchP2POrderBook(tradeType = "BUY") {
+async function fetchP2POrderBook() {
   const payload = {
-    "asset": "USDT",
-    "fiat": "VND",
-    "tradeType": tradeType,
-    "page": 1,
-    "rows": 20,
-    "payTypes": [],
-    "countries": [],
-    "proMerchantAds": false,
-    "shieldMerchantAds": false
-  };
-
-  const headers = {
-    'Content-Type': 'application/json',
-    'Accept': '*/*',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Origin': 'https://p2p.binance.com',
-    'Referer': `https://p2p.binance.com/en/trade/all-payments/USDT?fiat=VND`,
-    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+    fiat: 'VND',
+    page: 1,
+    rows: 10,
+    tradeType: 'SELL',
+    asset: 'USDT',
+    countries: [],
+    proMerchantAds: false,
+    shieldMerchantAds: false,
+    publisherType: null,
+    payTypes: []
   };
 
   try {
-    const response = await fetchWithRetry(BINANCE_P2P_URL, payload, headers);
-    return response?.data?.data || null;
+    const response = await fetchWithRetry(BINANCE_P2P_URL, {
+      method: 'POST',
+      data: payload,
+      headers: { 'Content-Type': 'application/json' }
+    });
+    return response.data?.data || [];
   } catch (error) {
-    console.error(`❌ P2P Fetch Error (${tradeType}):`, error.message);
-    return null;
+    console.error('❌ Binance P2P API Connection Error:', error.message);
+    return [];
   }
 }
 
 /**
- * Calculates the average of the 5 highest sell prices matching your wallet limits.
- * Note: When tradeType is "SELL" on Binance P2P, you are looking at ads from buyers 
- * who want to purchase your crypto. The prices are already sorted descending 
- * (highest payout first).
+ * Filter valid trading ads out of raw order books
  */
-async function calculateHighestSellPrice() {
-  const sellAds = await fetchP2POrderBook("SELL");
-  if (!sellAds || sellAds.length === 0) return null;
+function calculateHighestSellPrice(advs) {
+  const validAdvs = advs.filter(item => {
+    const price = parseFloat(item.adv.price);
+    const minAmount = parseFloat(item.adv.minSingleTransAmount);
+    const maxAmount = parseFloat(item.adv.maxSingleTransAmount);
 
-  // Extract prices from the top 5 ads (or fewer if less than 5 match filters)
-  const targetBatch = sellAds.slice(0, 5);
-  const totalSum = targetBatch.reduce((sum, entry) => sum + parseFloat(entry.adv.price), 0);
-  
-  return totalSum / targetBatch.length;
+    return (
+      price >= TARGET_PRICE &&
+      minAmount >= MIN_SINGLE_TRANS_AMOUNT &&
+      maxAmount <= MAX_SINGLE_TRANS_AMOUNT
+    );
+  });
+
+  if (validAdvs.length === 0) return null;
+
+  const highestAd = validAdvs.reduce((max, item) => 
+    parseFloat(item.adv.price) > parseFloat(max.adv.price) ? item : max
+  , validAdvs[0]);
+
+  return {
+    price: parseFloat(highestAd.adv.price),
+    merchantName: highestAd.advertiser.nickName,
+    advId: highestAd.adv.advNo,
+    minAmount: highestAd.adv.minSingleTransAmount,
+    maxAmount: highestAd.adv.maxSingleTransAmount
+  };
 }
 
+/**
+ * Dispatches raw content messages directly to Discord Webhooks
+ */
+async function sendDiscordNotification(content) {
+  if (!DISCORD_WEBHOOK_URL) {
+    console.log('⚠️ Missing DISCORD_WEBHOOK_URL variable. Output skipped.');
+    return;
+  }
+  try {
+    await axios.post(DISCORD_WEBHOOK_URL, { content });
+  } catch (error) {
+    console.error('❌ Failed delivering notification to Discord payload:', error.message);
+  }
+}
+
+/**
+ * Crawls Alternative.me crypto sentiment data streams
+ */
 async function fetchFearAndGreedData() {
   try {
     const response = await axios.get(FEAR_GREED_URL, { timeout: 5000 });
-    const currentData = response?.data?.data?.[0];
-    if (currentData) {
-      return { 
-        value: Number(currentData.value), 
-        classification: currentData.value_classification,
-        timestamp: currentData.timestamp 
+    const data = response.data?.data?.[0];
+    if (data) {
+      return {
+        value: data.value,
+        classification: data.value_classification
       };
     }
     return null;
   } catch (error) {
-    console.error('❌ Fear & Greed API Error:', error.message);
+    console.error('❌ Fear and Greed Index Connection Error:', error.message);
     return null;
   }
 }
 
 /**
- * Enhanced spot fetcher gathering high/low spreads alongside price changes
+ * Dynamic lookback calculation tracking method
+ */
+function calculateIntervalChanges(history, currentPrice) {
+  const results = {};
+  const now = Date.now();
+
+  // Automatically scales step loops using whatever values you passed to your ENV file
+  const intervals = [];
+  for (let i = TRACKING_INTERVAL_MIN; i <= TRACKING_WINDOW_MIN; i += TRACKING_INTERVAL_MIN) {
+    intervals.push(i);
+  }
+
+  intervals.forEach(minutes => {
+    const targetAgeMs = minutes * 60 * 1000;
+    const targetTimestamp = now - targetAgeMs;
+
+    let bestMatch = null;
+    let smallestDiff = Infinity;
+
+    for (const record of history) {
+      const diff = Math.abs(record.timestamp - targetTimestamp);
+      const tolerance = (TRACKING_INTERVAL_MIN * 60 * 1000) / 2; 
+      
+      if (diff < smallestDiff && diff < tolerance) { 
+        smallestDiff = diff;
+        bestMatch = record;
+      }
+    }
+
+    if (bestMatch) {
+      const percentChange = ((currentPrice - bestMatch.price) / bestMatch.price) * 100;
+      const sign = percentChange >= 0 ? '+' : '';
+      results[`${minutes}m`] = `${sign}${percentChange.toFixed(2)}%`;
+    } else {
+      results[`${minutes}m`] = '⏳ Calibrating';
+    }
+  });
+
+  return results;
+}
+
+/**
+ * Pulls, stores, and evaluates comparative spot history variations
  */
 async function fetchSpotTickerData(symbol) {
   try {
     const response = await axios.get(`${BINANCE_24HR_TICKER_URL}?symbol=${symbol}`, { timeout: 5000 });
     if (response?.data) {
+      const currentPrice = parseFloat(response.data.lastPrice);
+      const now = Date.now();
+
+      if (!priceHistoryLog.has(symbol)) {
+        priceHistoryLog.set(symbol, []);
+      }
+      const history = priceHistoryLog.get(symbol);
+      history.push({ timestamp: now, price: currentPrice });
+
+      // Clean logs dynamically according to maximum evaluation windows
+      const boundaryTime = now - MAX_HISTORY_WINDOW_MS;
+      while (history.length > 0 && history[0].timestamp < boundaryTime) {
+        history.shift();
+      }
+
       return {
-        rawPrice: parseFloat(response.data.lastPrice),
+        rawPrice: currentPrice,
         rawChange: parseFloat(response.data.priceChangePercent),
         highPrice: parseFloat(response.data.highPrice),
-        lowPrice: parseFloat(response.data.lowPrice)
+        lowPrice: parseFloat(response.data.lowPrice),
+        historyIntervals: calculateIntervalChanges(history, currentPrice)
       };
     }
     return null;
@@ -132,280 +221,115 @@ async function fetchSpotTickerData(symbol) {
 }
 
 /**
- * DYNAMIC QUANT ENGINE
- * Generates programmatic strategies using asset velocity spreads & market premium ratios
+ * Evaluates state updates and packages execution triggers
  */
-function runDynamicQuantEngine(fngValue, currentP2PPrice, btc, eth, bnb, sol) {
-  const actions = [];
-  let marketContext = "Stable Consolidation";
+async function executeTrackingRoutine() {
+  console.log('🤖 Executing evaluation pipeline routines...');
+  
+  const p2pAdvs = await fetchP2POrderBook();
+  const targetAd = calculateHighestSellPrice(p2pAdvs);
+  
+  const btcData = await fetchSpotTickerData('BTCUSDT');
+  const ethData = await fetchSpotTickerData('ETHUSDT');
+  const fngData = await fetchFearAndGreedData();
 
-  // P2P Premium/Discount Index vs Global Banking Spot Estimates 
-  const IMPLIED_GLOBAL_USD_VND = 25420; 
-  if (currentP2PPrice) {
-    const premiumRatio = ((currentP2PPrice / IMPLIED_GLOBAL_USD_VND) - 1) * 100;
-    
-    if (premiumRatio > 2.5) {
-      marketContext = "High Domestic Capital Flight";
-      actions.push(`⚠️ **P2P OVERPRICED (+${premiumRatio.toFixed(2)}% Premium):** Local demand for stablecoins is heavily decoupled from global rates. High risk of local capital exhaustion. Consider pausing heavy buy orders.`);
-    } else if (premiumRatio < -0.5) {
-      marketContext = "Domestic Capital Capitulation";
-      actions.push(`💎 **P2P UNDERPRICED (${premiumRatio.toFixed(2)}% Discount):** P2P is trading below global spot parity. Excellent cash-to-crypto fiat entry window via localized market mispricings.`);
-    }
-  }
-
-  // Macro Sentiment Velocity
-  if (fngValue < 25) {
-    actions.push(`📉 **MACRO VELOCITY (FnG ${fngValue} - EXTREME FEAR):** Deep historical value window. Market sentiment indicates severe panic. Mathematical historical data heavily favors systematic Spot dollar-cost averaging (DCA) over chasing high-velocity breakouts.`);
-  } else if (fngValue >= 80) {
-    actions.push(`🚨 **MACRO SATURATION (FnG ${fngValue} - EXTREME GREED):** Market risks overextension. Dynamic velocity exhaustion is imminent; secure profit targets and protect liquid capital reserves.`);
-  }
-
-  // Mathematical Rotation Matrix (Relative Strength Coefficients)
-  if (btc && eth && sol) {
-    const ethVsBtcSpread = eth.rawChange - btc.rawChange;
-    const solVsBtcSpread = sol.rawChange - btc.rawChange;
-
-    if (solVsBtcSpread > 4.0) {
-      const dailyVolatility = ((sol.highPrice - sol.lowPrice) / sol.lowPrice) * 100;
-      actions.push(`🔄 **SOLANA ALPHA ROTATION:** SOL is outperforming BTC by **${solVsBtcSpread.toFixed(2)}%** with a 24h trading spread volatility of **${dailyVolatility.toFixed(2)}%**. Market favor has aggressive capital rotation shifting toward the Solana ecosystem.`);
-    } else if (ethVsBtcSpread > 2.5) {
-      actions.push(`🔄 **EVM LARGE-CAP EXPANSION:** ETH velocity is outpacing BTC by **${ethVsBtcSpread.toFixed(2)}%**. Capital flows are moving down the risk curve into legacy smart-contract platforms.`);
-    } else if (btc.rawChange > eth.rawChange && btc.rawChange > sol.rawChange) {
-      actions.push(`🛡️ **LIQUIDITY DRAINDOWN TO CORE:** BTC dominance is crushing major alts (ETH Spread: ${ethVsBtcSpread.toFixed(2)}% | SOL Spread: ${solVsBtcSpread.toFixed(2)}%). Capital is exiting high-risk networks back into core digital gold layers.`);
-    }
-  }
-
-  if (actions.length === 0) {
-    actions.push("⏱️ **EQUILIBRIUM MONITORING:** Variance spreads across asset blocks are minimal. Volatility compression is occurring; hold neutral balance profiles.");
-  }
-
-  return {
-    context: marketContext,
-    bullets: actions.join("\n")
-  };
-}
-
-/**
- * Cache Pruning Logic
- */
-function purgeOldCacheTrackingRecords() {
-  if (adNotificationTracker.size > 500) {
-    const trackingKeys = Array.from(adNotificationTracker.keys());
-    for (let i = 0; i < 150; i++) {
-      adNotificationTracker.delete(trackingKeys[i]);
-    }
-  }
-  if (fngAlertTracker.size > 30) {
-    const trackingArray = Array.from(fngAlertTracker);
-    fngAlertTracker.delete(trackingArray[0]);
-  }
-}
-
-/**
- * Threshold Verification Engine Loop
- */
-async function monitorThreshold() {
-  try {
-    const fngData = await fetchFearAndGreedData();
-    if (fngData) {
-      const fngValue = fngData.value;
-      const fngTimestamp = fngData.timestamp;
-
-      if (fngValue < 25 && !fngAlertTracker.has(fngTimestamp)) {
-        fngAlertTracker.add(fngTimestamp);
-        
-        // Fetch and calculate the top 5 sell average
-        const avgSellPrice = await calculateHighestSellPrice();
-        const sellPriceText = avgSellPrice 
-          ? `**${avgSellPrice.toLocaleString('en-US', { maximumFractionDigits: 2 })} VND** (Avg of top 5)` 
-          : 'Data Unavailable';
-
-        const fngWarningMessage = [
-          `🚨 **CRITICAL MACRO WARNING: EXTREME FEAR** 🚨`,
-          `==============================`,
-          `🎭 **Fear & Greed Index dropped to:** **${fngValue}** (${fngData.classification})`,
-          `💰 **Highest Cash-Out Sell Price:** ${sellPriceText}`,
-          `📉 *Sentiment threshold (< 25) triggered. High historical variance indicates capitulation patterns.*`,
-          `💼 **Strategy Directive:** Look for localized P2P discounts to execute structural fiat-to-crypto value allocations.`
-        ].join('\n');
-
-        await sendDiscordNotification(fngWarningMessage);
-      }
-    }
-
-    const adList = await fetchP2POrderBook("BUY");
-    if (!adList || adList.length === 0) return;
-
-    // Filter ad listings based on single transaction amount specifications
-    const filteredAds = adList.filter(entry => {
-      const minTrans = Number(entry.adv.minSingleTransAmount);
-      const maxTrans = Number(entry.adv.maxSingleTransAmount);
-      return maxTrans >= MAX_SINGLE_TRANS_AMOUNT;
-    });
-
-    if (filteredAds.length === 0) {
-      console.log(`[${new Date().toLocaleTimeString()}] Audit -> No ads matched the single transaction limits.`);
-      return;
-    }
-
-    // Cache the best matching ad structure
-    const topAd = filteredAds[0];
+  if (btcData || ethData || targetAd) {
     lastKnownMarketData = {
-      price: parseFloat(topAd.adv.price),
-      merchant: topAd.advertiser.nickName,
-      minSingleTransAmount: topAd.adv.minSingleTransAmount,
-      maxSingleTransAmount: topAd.adv.maxSingleTransAmount
+      p2p: targetAd,
+      btc: btcData,
+      eth: ethData,
+      fng: fngData,
+      updatedAt: new Date().toLocaleTimeString()
     };
+  }
 
-    const fngValueText = fngData ? `${fngData.value} (${fngData.classification})` : 'Data Unavailable';
-    console.log(`[${new Date().toLocaleTimeString()}] Audit -> Best P2P Buy: ${lastKnownMarketData.price} VND | FnG: ${fngValueText}`);
-
-    // Process price target matches
-    for (const entry of filteredAds) {
-      const price = parseFloat(entry.adv.price);
-      const merchant = entry.advertiser.nickName;
-      const advNo = entry.adv.advNo;
-      const minSingleTrans = Number(entry.adv.minSingleTransAmount).toLocaleString('en-US');
-      const maxSingleTrans = Number(entry.adv.maxSingleTransAmount).toLocaleString('en-US');
-
-      if (price <= TARGET_PRICE) {
-        const currentAlertCount = adNotificationTracker.get(advNo) || 0;
-
-        if (currentAlertCount < MAX_ALERTS_PER_AD) {
-          adNotificationTracker.set(advNo, currentAlertCount + 1);
-
-          const alertMessage = [
-            `⚠️ **P2P TARGET REACHED**`,
-            `> 💰 **Buy Price:** ${price} VND`,
-            `> 👤 **Merchant:** ${merchant}`,
-            `> 🆔 **Ad No:** ${advNo}`,
-            `> 📉 **Min Limit:** ${minSingleTrans} VND`,
-            `> 📈 **Max Limit:** ${maxSingleTrans} VND`,
-            `> 🎯 **Target Set:** Under ${TARGET_PRICE} VND`
-          ].join('\n');
-                               
-          await sendDiscordNotification(alertMessage);
-          break; 
-        }
-      }
+  // P2P Alert Processor
+  if (targetAd) {
+    const alertCount = adNotificationTracker.get(targetAd.advId) || 0;
+    if (alertCount < MAX_ALERTS_PER_AD) {
+      const message = `🚨 **P2P Target Hit!**\n` +
+                      `• **Merchant:** ${targetAd.merchantName}\n` +
+                      `• **Price:** ${targetAd.price.toLocaleString()} VND\n` +
+                      `• **Limits:** ${Number(targetAd.minAmount).toLocaleString()} - ${Number(targetAd.maxAmount).toLocaleString()} VND`;
+      
+      await sendDiscordNotification(message);
+      adNotificationTracker.set(targetAd.advId, alertCount + 1);
     }
+  }
 
-    purgeOldCacheTrackingRecords();
-  } catch (error) {
-    console.error('❌ Threshold Monitor Cycle Error:', error.message);
+  // Fear & Greed Sentiment Trigger
+  if (fngData) {
+    const fngScore = parseInt(fngData.value);
+    if ((fngScore <= 20 || fngScore >= 80) && !fngAlertTracker.has(fngScore)) {
+      const emotionAlert = fngScore <= 20 ? '😨 Extreme Fear' : '🤑 Extreme Greed';
+      const fngMessage = `⚠️ **Market Sentiment Warning**\n` +
+                         `The Crypto Fear & Greed Index hit **${fngScore}** (${emotionAlert}). Expect high volatility!`;
+      await sendDiscordNotification(fngMessage);
+      fngAlertTracker.add(fngScore);
+    }
   }
 }
 
 /**
- * Summary Displayer
+ * Compiles a visual summary card report out of localized trackers
  */
-async function sendInstantSummary() {
-  try {
-    const fngData = await fetchFearAndGreedData();
-    const fngIndexText = fngData ? `${fngData.value} (${fngData.classification})` : 'Data Unavailable';
-    const marketData = lastKnownMarketData;
-
-    const [btc, eth, bnb, sol, avgSellPrice] = await Promise.all([
-      fetchSpotTickerData('BTCUSDT'),
-      fetchSpotTickerData('ETHUSDT'),
-      fetchSpotTickerData('BNBUSDT'),
-      fetchSpotTickerData('SOLUSDT'),
-      calculateHighestSellPrice()
-    ]);
-
-    const formatDisplay = (data, isBtc) => {
-      if (!data) return { text: 'Fetch Error', indicator: '❌' };
-      const formattedPrice = isBtc 
-        ? Math.floor(data.rawPrice).toLocaleString('en-US') 
-        : data.rawPrice.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-      const sign = data.rawChange >= 0 ? '+' : '';
-      return {
-        text: `$${formattedPrice} (${sign}${data.rawChange.toFixed(2)}%)`,
-        indicator: data.rawChange >= 0 ? '🟩' : '🟥'
-      };
-    };
-
-    const btcDisplay = formatDisplay(btc, true);
-    const ethDisplay = formatDisplay(eth, false);
-    const bnbDisplay = formatDisplay(bnb, false);
-    const solDisplay = formatDisplay(sol, false);
-
-    let p2pBuyText = 'No recent matching data collected';
-    if (marketData) {
-      const formattedMin = Number(marketData.minSingleTransAmount).toLocaleString('en-US');
-      const formattedMax = Number(marketData.maxSingleTransAmount).toLocaleString('en-US');
-      p2pBuyText = `**${marketData.price} VND** (User: ${marketData.merchant})\n> ⚖️ **Ad Range Limits:** ${formattedMin} - ${formattedMax} VND`;
-    }
-
-    const sellPriceText = avgSellPrice 
-      ? `**${avgSellPrice.toLocaleString('en-US', { maximumFractionDigits: 2 })} VND** (Avg of top 5)` 
-      : 'Data Unavailable';
-
-    const fngValue = fngData ? fngData.value : 50; 
-    const p2pPriceRaw = marketData ? marketData.price : null;
-    const advice = runDynamicQuantEngine(fngValue, p2pPriceRaw, btc, eth, bnb, sol);
-
-    const summaryMessage = [
-      `📊 **DYNAMIC QUANT REPORT**`,
-      `==============================`,
-      `📉 **Instant Lowest P2P Buy:** ${p2pBuyText}`,
-      `📈 **Highest P2P Sell (Cash-Out):** ${sellPriceText}`,
-      `🎭 **Crypto Fear & Greed:** ${fngIndexText}`,
-      `🎯 **Active Alert Target:** Under ${TARGET_PRICE} VND`,
-      `==============================`,
-      `🪙 **Global Spot Market Indexes:**`,
-      `> ${btcDisplay.indicator} **BTC:** ${btcDisplay.text}`,
-      `> ${ethDisplay.indicator} **ETH:** ${ethDisplay.text}`,
-      `> ${bnbDisplay.indicator} **BNB:** ${bnbDisplay.text}`,
-      `> ${solDisplay.indicator} **SOL:** ${solDisplay.text}`,
-      `==============================`,
-      `🧠 **MATHEMATICAL ROTATION METRICS:**`,
-      `> 📋 **Macro Phase Context:** *${advice.context}*`,
-      ``,
-      `${advice.bullets}`,
-      `==============================`,
-      `⚙️ *Bot Status: Operational*`
-    ].join('\n');
-
-    await sendDiscordNotification(summaryMessage);
-  } catch (error) {
-    console.error('❌ Failed to compile dynamic summary snapshot:', error.message);
+async function transmitSummaryReport() {
+  if (!lastKnownMarketData) {
+    console.log('⚠️ Skipping summary sequence: No current data cached yet.');
+    return;
   }
+
+  const { p2p, btc, eth, fng, updatedAt } = lastKnownMarketData;
+
+  let summary = `📊 **MARKET SNAPSHOT SUMMARY** (${updatedAt})\n`;
+  summary += `───────────────────\n`;
+
+  if (p2p) {
+    summary += `💵 **P2P Best Offer:** ${p2p.price.toLocaleString()} VND (${p2p.merchantName})\n\n`;
+  } else {
+    summary += `💵 **P2P Best Offer:** No ads found matching criteria\n\n`;
+  }
+
+  if (btc) {
+    const btcChanges = Object.entries(btc.historyIntervals)
+      .map(([time, change]) => `**${time}:** ${change}`)
+      .join(' | ');
+
+    summary += `🪙 **BTC/USDT:** $${btc.rawPrice.toLocaleString()}\n` +
+               `• 24h Change: ${btc.rawChange >= 0 ? '+' : ''}${btc.rawChange.toFixed(2)}%\n` +
+               `• Range Log: ${btcChanges}\n\n`;
+  }
+
+  if (eth) {
+    const ethChanges = Object.entries(eth.historyIntervals)
+      .map(([time, change]) => `**${time}:** ${change}`)
+      .join(' | ');
+
+    summary += `🔷 **ETH/USDT:** $${eth.rawPrice.toLocaleString()}\n` +
+               `• 24h Change: ${eth.rawChange >= 0 ? '+' : ''}${eth.rawChange.toFixed(2)}%\n` +
+               `• Range Log: ${ethChanges}\n\n`;
+  }
+
+  if (fng) {
+    summary += `📈 **Fear & Greed Index:** ${fng.value} (${fng.classification})\n`;
+  }
+  
+  summary += `───────────────────`;
+
+  await sendDiscordNotification(summary);
 }
 
-async function sendDiscordNotification(messageText) {
-  if (!DISCORD_WEBHOOK_URL) return;
-  try {
-    await axios.post(DISCORD_WEBHOOK_URL, { content: messageText }, { timeout: 5000 });
-  } catch (error) {
-    console.error('❌ Discord Delivery Failure:', error.message);
-  }
-}
+// --- Scheduler Loop Processors ---
+executeTrackingRoutine(); 
+setInterval(executeTrackingRoutine, MONITOR_INTERVAL_MS);
+setInterval(transmitSummaryReport, SUMMARY_INTERVAL_MS);
 
+// Simple Health Check Server Interface
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ status: 'online' }));
+  res.end(JSON.stringify({ status: 'healthy', monitoring_interval_ms: MONITOR_INTERVAL_MS }));
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 Server executing tracking workflows on port ${PORT}`);
-  
-  // Initial execution
-  monitorThreshold();
-  
-  const monitorId = setInterval(monitorThreshold, MONITOR_INTERVAL_MS);
-  const summaryId = setInterval(sendInstantSummary, SUMMARY_INTERVAL_MS);
-
-  const cleanExit = () => {
-    console.log('Stopping active tracking timers...');
-    clearInterval(monitorId);
-    clearInterval(summaryId);
-    server.close(() => {
-      console.log('HTTP Server closed cleanly.');
-      process.exit(0);
-    });
-  };
-
-  process.on('SIGINT', cleanExit);
-  process.on('SIGTERM', cleanExit);
+  console.log(`🚀 Telemetry runtime service listening on port ${PORT}`);
 });
