@@ -28,7 +28,7 @@ let lastKnownMarketData = null;
 const adNotificationTracker = new Map(); 
 const MAX_ALERTS_PER_AD = 3;
 
-// Tracker to prevent FnG alert spamming (tracks by daily timestamp provided by the API)
+// Tracker to prevent FnG alert spamming (tracks alerts by date + index value)
 const fngAlertTracker = new Set();
 
 // Gating state to prevent rate-limiting on the daily-updating FnG API endpoint
@@ -268,9 +268,11 @@ function purgeOldCacheTrackingRecords() {
       adNotificationTracker.delete(trackingKeys[i]);
     }
   }
-  if (fngAlertTracker.size > 30) {
+  if (fngAlertTracker.size > 100) {
     const trackingArray = Array.from(fngAlertTracker);
-    fngAlertTracker.delete(trackingArray[0]);
+    for (let i = 0; i < 30; i++) {
+      fngAlertTracker.delete(trackingArray[i]);
+    }
   }
 }
 
@@ -282,10 +284,11 @@ async function monitorThreshold() {
     const fngData = await fetchFearAndGreedData();
     if (fngData) {
       const fngValue = fngData.value;
-      const fngTimestamp = fngData.timestamp;
+      const todayUtc = new Date().toISOString().split('T')[0];
+      const fngDailyKey = `${todayUtc}:${fngValue}`;
 
-      if (fngValue < 25 && !fngAlertTracker.has(fngTimestamp)) {
-        fngAlertTracker.add(fngTimestamp);
+      if (fngValue < 25 && !fngAlertTracker.has(fngDailyKey)) {
+        fngAlertTracker.add(fngDailyKey);
         
         const avgSellPrice = await calculateHighestSellPrice();
         const sellPriceText = avgSellPrice 
