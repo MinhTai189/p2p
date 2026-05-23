@@ -61,6 +61,18 @@ let cachedFngData = null;
 const priceHistoryLog = new Map();
 
 /**
+ * Helper to determine if current time falls within VN quiet hours (23:00 to 06:00 GMT+7)
+ */
+function isVnQuietHours() {
+  const vnTimeString = new Date().toLocaleString("en-US", { timeZone: "Asia/Ho_Chi_Minh" });
+  const vnHour = new Date(vnTimeString).getHours();
+
+  // Returns true if the hour is 23 (11 PM) up to and including 5 (5:59 AM)
+  return vnHour >= 23 || vnHour < 6;
+}
+
+
+/**
  * Robust fetcher wrapper with Exponential Backoff
  */
 async function fetchWithRetry(url, data, headers, retries = 3, delay = 2000) {
@@ -476,7 +488,9 @@ async function monitorThreshold() {
 
       if (fngValue < 25 && !fngAlertTracker.has(fngDailyKey)) {
         fngAlertTracker.add(fngDailyKey);
-        
+
+        // GATED: Only broadcast to Discord if outside quiet VN hour bands
+        if (!isVnQuietHours()) {
         const avgSellPrice = await calculateHighestSellPrice();
         const sellPriceText = avgSellPrice 
           ? `**${avgSellPrice.toLocaleString('en-US', { maximumFractionDigits: 2 })} VND** (Avg of top 5)` 
@@ -492,7 +506,7 @@ async function monitorThreshold() {
         ].join('\n');
 
         await sendDiscordNotification(fngWarningMessage);
-      }
+      }}
     }
 
     // Refresh spot ticker history for configured tracking symbols
@@ -573,6 +587,12 @@ async function monitorThreshold() {
     const adList = await fetchP2POrderBook("BUY");
     if (!adList || adList.length === 0) return;
 
+    // GATED: Exit the function before iterating over individual target matches during quiet hours
+    if (isVnQuietHours()) {
+      purgeOldCacheTrackingRecords();
+      return;
+    }
+
     const filteredAds = adList.filter(entry => {
       const minTrans = Number(entry.adv.minSingleTransAmount);
       const maxTrans = Number(entry.adv.maxSingleTransAmount);
@@ -635,6 +655,12 @@ async function monitorThreshold() {
  * Summary Displayer
  */
 async function sendInstantSummary() {
+// GATED: Instantly drops scheduled intervals if executed between 23:00 and 06:00
+  if (isVnQuietHours()) {
+    console.log(`[${new Date().toLocaleTimeString()}] Summary omitted. VN night lock active.`);
+    return;
+  }
+  
   console.log(`[${new Date().toISOString()}] sendInstantSummary() start`);
   try {
     const fngData = await fetchFearAndGreedData();
