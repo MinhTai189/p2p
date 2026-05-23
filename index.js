@@ -25,9 +25,23 @@ const BINANCE_24HR_TICKER_URL = 'https://api.binance.com/api/v3/ticker/24hr';
 const BINANCE_STABLECOIN_PARITY_URL = 'https://api.binance.com/api/v3/ticker/price?symbol=USDCUSDT';
 const BINANCE_LONG_SHORT_RATIO_URL_BASE = 'https://fapi.binance.com/futures/data/topLongShortAccountRatio';
 const BINANCE_PREMIUM_INDEX_URL = 'https://fapi.binance.com/fapi/v1/premiumIndex';
+const BINANCE_KLINES_URL = 'https://api.binance.com/api/v3/klines';
 const IMPLIED_GLOBAL_USD_VND = Number(process.env.IMPLIED_GLOBAL_USD_VND) || 25420;
 const STABLECOIN_DEPEG_THRESHOLD = Number(process.env.STABLECOIN_DEPEG_THRESHOLD) || 0.002;
 const FUNDING_RATE_WARNING_THRESHOLD = Number(process.env.FUNDING_RATE_WARNING_THRESHOLD) || 0.0005;
+
+// Track downtrend warnings to avoid duplicate messages per day: key -> `${date}:${symbol}:${level}`
+const downtrendAlertTracker = new Set();
+// Symbols tracked by the bot for spot fetching and summary display (comma-separated env)
+const TRACKING_SYMBOLS = (process.env.TRACKING_SYMBOLS || 'BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT')
+  .split(',')
+  .map(s => s.trim().toUpperCase())
+  .filter(Boolean);
+// Symbols used specifically for downtrend evaluation (can be smaller set)
+const DOWNTREND_SYMBOLS = (process.env.DOWNTREND_SYMBOLS || 'BTCUSDT,ETHUSDT,SOLUSDT')
+  .split(',')
+  .map(s => s.trim().toUpperCase())
+  .filter(Boolean);
 
 // Global memory state
 let lastKnownMarketData = null;
@@ -139,6 +153,67 @@ async function fetchFundingRate(symbol = 'BTCUSDT') {
     console.error(`❌ Funding Rate Fetch Error (${symbol}):`, error.message);
     return null;
   }
+}
+
+async function fetchKlines(symbol = 'BTCUSDT', interval = '1d', limit = 90) {
+  try {
+    const response = await axios.get(`${BINANCE_KLINES_URL}?symbol=${symbol}&interval=${interval}&limit=${limit}`, { timeout: 8000 });
+    return Array.isArray(response.data) ? response.data : null;
+  } catch (error) {
+    console.error(`❌ Klines Fetch Error (${symbol} ${interval}):`, error.message);
+    return null;
+  }
+}
+
+/**
+ * Evaluate downtrend levels for a given symbol using klines history.
+ * Returns an object { level1, level2, level3, sniper30 } where each is boolean and details included.
+ */
+async function evaluateDowntrend(symbol) {
+  // Level 1: 1-2 days (use hourly candles, last 48 hours)
+  const klines1h = await fetchKlines(symbol, '1h', 48);
+  const nowPriceData = await fetchSpotTickerData(symbol);
+  const result = { symbol, level1: null, level2: null, level3: null, sniper30: null };
+
+  if (klines1h && klines1h.length > 0 && nowPriceData) {
+    const closes = klines1h.map(k => parseFloat(k[4])); // close price
+    const peak = Math.max(...closes);
+    const current = nowPriceData.rawPrice;
+    const dropPct = ((peak - current) / peak) * 100;
+    result.level1 = { dropPct, peakWindowHours: klines1h.length };
+  }
+
+  // Level 2: 1-3 months (use daily candles, last 90 days)
+  const klines1d = await fetchKlines(symbol, '1d', 90);
+  if (klines1d && klines1d.length > 0 && nowPriceData) {
+    const closes = klines1d.map(k => parseFloat(k[4]));
+    const peak = Math.max(...closes);
+    const current = nowPriceData.rawPrice;
+    const dropPct = ((peak - current) / peak) * 100;
+    result.level2 = { dropPct, peakWindowDays: klines1d.length };
+  }
+
+  // Level 3: 1-2 years (use daily candles, last up to 730 days - limit capped at 1000)
+  const klinesLong = await fetchKlines(symbol, '1d', 730);
+  if (klinesLong && klinesLong.length > 0 && nowPriceData) {
+    const closes = klinesLong.map(k => parseFloat(k[4]));
+    const peak = Math.max(...closes);
+    const current = nowPriceData.rawPrice;
+    const dropPct = ((peak - current) / peak) * 100;
+    result.level3 = { dropPct, peakWindowDays: klinesLong.length };
+  }
+
+  // Sniper 30 rule: 30% drop within the past 30 days
+  const klines30d = await fetchKlines(symbol, '1d', 30);
+  if (klines30d && klines30d.length > 0 && nowPriceData) {
+    const closes = klines30d.map(k => parseFloat(k[4]));
+    const peak = Math.max(...closes);
+    const current = nowPriceData.rawPrice;
+    const dropPct = ((peak - current) / peak) * 100;
+    result.sniper30 = { dropPct, peakWindowDays: klines30d.length };
+  }
+
+  return result;
 }
 
 async function fetchFearAndGreedData() {
@@ -419,12 +494,80 @@ async function monitorThreshold() {
       }
     }
 
-    await Promise.all([
-      fetchSpotTickerData('BTCUSDT'),
-      fetchSpotTickerData('ETHUSDT'),
-      fetchSpotTickerData('BNBUSDT'),
-      fetchSpotTickerData('SOLUSDT')
-    ]);
+    // Refresh spot ticker history for configured tracking symbols
+    await Promise.all(TRACKING_SYMBOLS.map(s => fetchSpotTickerData(s)));
+
+    // Evaluate downtrend conditions for key symbols and send contextual warnings (once per day per level)
+    try {
+      const symbolsToCheck = DOWNTREND_SYMBOLS;
+      for (const s of symbolsToCheck) {
+        evaluateDowntrend(s).then(evt => {
+          if (!evt) return;
+          const today = new Date().toISOString().split('T')[0];
+
+          // Level 1: 10-20% drop within 48h
+          if (evt.level1 && evt.level1.dropPct >= 10 && evt.level1.dropPct <= 20) {
+            const key = `${today}:${s}:L1`;
+            if (!downtrendAlertTracker.has(key)) {
+              downtrendAlertTracker.add(key);
+              const msg = [
+                `🚨 **Level 1 - Strong Short-Term Crash Detected (${s})**`,
+                `> 🔻 Drop: ${evt.level1.dropPct.toFixed(2)}% over last ${evt.level1.peakWindowHours} hours`,
+                `> ⏱ Timeframe: 24-48 hours`,
+                `**Action:** Consider small DCA buys (10-20% of backup capital). Expect short-term technical bounces of ~3-5% after a sharp 15% drop.`
+              ].join('\n');
+              sendDiscordNotification(msg);
+            }
+          }
+
+          // Level 2: 30-50% drop within 1-3 months
+          if (evt.level2 && evt.level2.dropPct >= 30 && evt.level2.dropPct <= 50) {
+            const key = `${today}:${s}:L2`;
+            if (!downtrendAlertTracker.has(key)) {
+              downtrendAlertTracker.add(key);
+              const msg = [
+                `🚨 **Level 2 - Medium-Term Strong Downtrend (${s})**`,
+                `> 🔻 Drop: ${evt.level2.dropPct.toFixed(2)}% vs recent peak (last ${evt.level2.peakWindowDays} days)`,
+                `> ⏱ Timeframe: 1-3 months`,
+                `**Action:** Golden opportunity for larger buys. Consider splitting capital into tranches to accumulate between 30%-50% retracements.`
+              ].join('\n');
+              sendDiscordNotification(msg);
+            }
+          }
+
+          // Level 3: Crypto winter style deep drawdown
+          if (evt.level3 && ((s === 'BTCUSDT' || s === 'ETHUSDT') ? evt.level3.dropPct >= 75 : evt.level3.dropPct >= 90)) {
+            const key = `${today}:${s}:L3`;
+            if (!downtrendAlertTracker.has(key)) {
+              downtrendAlertTracker.add(key);
+              const msg = [
+                `🚨 **Level 3 - Crypto Winter Detected (${s})**`,
+                `> 🔻 Drop: ${evt.level3.dropPct.toFixed(2)}% vs multi-year peak`,
+                `> ⏱ Timeframe: 1-2 years`,
+                `**Action:** This is a deep long-term value zone. Only deploy capital if you have 2-3 year horizon.`
+              ].join('\n');
+              sendDiscordNotification(msg);
+            }
+          }
+
+          // Sniper 30 rule: notify if 30%+ drop within last 30 days
+          if (evt.sniper30 && evt.sniper30.dropPct >= 30) {
+            const key = `${today}:${s}:SNIPER30`;
+            if (!downtrendAlertTracker.has(key)) {
+              downtrendAlertTracker.add(key);
+              const msg = [
+                `🎯 **SNIPER-30 SIGNAL (${s})**`,
+                `> 🔻 Drop: ${evt.sniper30.dropPct.toFixed(2)}% from the 30-day peak`,
+                `**Rule:** Consider splitting your USDT into 3 parts and buy at 30% / 40% / 50% drops respectively.`
+              ].join('\n');
+              sendDiscordNotification(msg);
+            }
+          }
+        }).catch(err => console.error('❌ Downtrend Eval Error:', err.message));
+      }
+    } catch (e) {
+      console.error('❌ Downtrend evaluation loop error:', e.message);
+    }
 
     const adList = await fetchP2POrderBook("BUY");
     if (!adList || adList.length === 0) return;
@@ -495,17 +638,33 @@ async function sendInstantSummary() {
     const fngIndexText = fngData ? `${fngData.value} (${fngData.classification})` : 'Data Unavailable';
     const marketData = lastKnownMarketData;
 
-    const [btc, eth, bnb, sol, avgSellPrice, stablecoinParity, btcLongShortRatio, btcFundingRate, solFundingRate] = await Promise.all([
-      fetchSpotTickerData('BTCUSDT'),
-      fetchSpotTickerData('ETHUSDT'),
-      fetchSpotTickerData('BNBUSDT'),
-      fetchSpotTickerData('SOLUSDT'),
+    // Fetch spot data for tracking symbols, plus common extras
+    const spotPromises = TRACKING_SYMBOLS.map(s => fetchSpotTickerData(s));
+    const extraPromises = [
       calculateHighestSellPrice(),
       fetchStablecoinParity(),
       fetchLongShortRatio('BTCUSDT'),
       fetchFundingRate('BTCUSDT'),
       fetchFundingRate('SOLUSDT')
-    ]);
+    ];
+    const allResults = await Promise.all([...spotPromises, ...extraPromises]);
+    const spotResults = allResults.slice(0, TRACKING_SYMBOLS.length);
+    const avgSellPrice = allResults[TRACKING_SYMBOLS.length];
+    const stablecoinParity = allResults[TRACKING_SYMBOLS.length + 1];
+    const btcLongShortRatio = allResults[TRACKING_SYMBOLS.length + 2];
+    const btcFundingRate = allResults[TRACKING_SYMBOLS.length + 3];
+    const solFundingRate = allResults[TRACKING_SYMBOLS.length + 4];
+
+    // Map spot results by symbol for easy access
+    const spotMap = {};
+    TRACKING_SYMBOLS.forEach((sym, idx) => {
+      spotMap[sym] = spotResults[idx] || null;
+    });
+
+    const btc = spotMap['BTCUSDT'] || null;
+    const eth = spotMap['ETHUSDT'] || null;
+    const bnb = spotMap['BNBUSDT'] || null;
+    const sol = spotMap['SOLUSDT'] || null;
 
     const formatDisplay = (data, isBtc) => {
       if (!data) return { text: 'Fetch Error', indicator: '❌', intervals: '' };
@@ -525,10 +684,11 @@ async function sendInstantSummary() {
       };
     };
 
-    const btcDisplay = formatDisplay(btc, true);
-    const ethDisplay = formatDisplay(eth, false);
-    const bnbDisplay = formatDisplay(bnb, false);
-    const solDisplay = formatDisplay(sol, false);
+    // Build display entries for each tracked symbol
+    const displays = TRACKING_SYMBOLS.map(sym => ({
+      symbol: sym,
+      display: formatDisplay(spotMap[sym], sym === 'BTCUSDT')
+    }));
 
     let p2pBuyText = 'No recent matching data collected';
     if (marketData) {
@@ -558,17 +718,11 @@ async function sendInstantSummary() {
       `🎯 **Active Alert Target:** Under ${TARGET_PRICE} VND`,
       `==============================`,
       `🪙 **Global Spot Market Indexes & History Matrix:**`,
-      `> ${btcDisplay.indicator} **BTC:** ${btcDisplay.text}`,
-      `> ⏱️ ${btcDisplay.intervals}`,
-      `>`,
-      `> ${ethDisplay.indicator} **ETH:** ${ethDisplay.text}`,
-      `> ⏱️ ${ethDisplay.intervals}`,
-      `>`,
-      `> ${bnbDisplay.indicator} **BNB:** ${bnbDisplay.text}`,
-      `> ⏱️ ${bnbDisplay.intervals}`,
-      `>`,
-      `> ${solDisplay.indicator} **SOL:** ${solDisplay.text}`,
-      `> ⏱️ ${solDisplay.intervals}`,
+      ...displays.flatMap(({ symbol, display }) => ([
+        `> ${display.indicator} **${symbol.replace('USDT','')}**: ${display.text}`,
+        `> ⏱️ ${display.intervals}`,
+        `>`
+      ])),
       `==============================`,
       `🧠 **MATHEMATICAL ROTATION METRICS:**`,
       `> 📋 **Macro Phase Context:** *${advice.context}*`,
