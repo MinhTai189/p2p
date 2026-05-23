@@ -85,16 +85,8 @@ async function calculateHighestSellPrice() {
   const sellAds = await fetchP2POrderBook("SELL");
   if (!sellAds || sellAds.length === 0) return null;
 
-  const filteredSellAds = sellAds.filter(entry => {
-    const minTrans = Number(entry.adv.minSingleTransAmount);
-    const maxTrans = Number(entry.adv.maxSingleTransAmount);
-    return minTrans <= MAX_SINGLE_TRANS_AMOUNT && maxTrans >= MIN_SINGLE_TRANS_AMOUNT;
-  });
-
-  if (filteredSellAds.length === 0) return null;
-
   // Extract prices from the top 5 ads (or fewer if less than 5 match filters)
-  const targetBatch = filteredSellAds.slice(0, 5);
+  const targetBatch = sellAds.slice(0, 5);
   const totalSum = targetBatch.reduce((sum, entry) => sum + parseFloat(entry.adv.price), 0);
   
   return totalSum / targetBatch.length;
@@ -248,7 +240,7 @@ async function monitorThreshold() {
     const filteredAds = adList.filter(entry => {
       const minTrans = Number(entry.adv.minSingleTransAmount);
       const maxTrans = Number(entry.adv.maxSingleTransAmount);
-      return maxTrans >= MIN_SINGLE_TRANS_AMOUNT;
+      return maxTrans >= MAX_SINGLE_TRANS_AMOUNT;
     });
 
     if (filteredAds.length === 0) {
