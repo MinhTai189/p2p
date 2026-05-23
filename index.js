@@ -23,8 +23,11 @@ const BINANCE_P2P_URL = 'https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/se
 const FEAR_GREED_URL = 'https://api.alternative.me/fng/';
 const BINANCE_24HR_TICKER_URL = 'https://api.binance.com/api/v3/ticker/24hr';
 const BINANCE_STABLECOIN_PARITY_URL = 'https://api.binance.com/api/v3/ticker/price?symbol=USDCUSDT';
+const BINANCE_LONG_SHORT_RATIO_URL_BASE = 'https://fapi.binance.com/futures/data/topLongShortAccountRatio';
+const BINANCE_PREMIUM_INDEX_URL = 'https://fapi.binance.com/fapi/v1/premiumIndex';
 const IMPLIED_GLOBAL_USD_VND = Number(process.env.IMPLIED_GLOBAL_USD_VND) || 25420;
 const STABLECOIN_DEPEG_THRESHOLD = Number(process.env.STABLECOIN_DEPEG_THRESHOLD) || 0.002;
+const FUNDING_RATE_WARNING_THRESHOLD = Number(process.env.FUNDING_RATE_WARNING_THRESHOLD) || 0.0005;
 
 // Global memory state
 let lastKnownMarketData = null;
@@ -112,6 +115,28 @@ async function fetchStablecoinParity() {
     return parseFloat(response.data.price);
   } catch (error) {
     console.error('❌ Stablecoin Parity Fetch Error:', error.message);
+    return null;
+  }
+}
+
+async function fetchLongShortRatio(symbol = 'BTCUSDT') {
+  try {
+    const response = await axios.get(`${BINANCE_LONG_SHORT_RATIO_URL_BASE}?symbol=${symbol}&period=5m&limit=1`, { timeout: 5000 });
+    const ratio = parseFloat(response.data?.[0]?.longShortRatio);
+    return Number.isFinite(ratio) ? ratio : null;
+  } catch (error) {
+    console.error('❌ Long/Short Ratio Fetch Error:', error.message);
+    return null;
+  }
+}
+
+async function fetchFundingRate(symbol = 'BTCUSDT') {
+  try {
+    const response = await axios.get(`${BINANCE_PREMIUM_INDEX_URL}?symbol=${symbol}`, { timeout: 5000 });
+    const lastFundingRate = parseFloat(response.data?.lastFundingRate);
+    return Number.isFinite(lastFundingRate) ? lastFundingRate : null;
+  } catch (error) {
+    console.error(`❌ Funding Rate Fetch Error (${symbol}):`, error.message);
     return null;
   }
 }
@@ -224,7 +249,7 @@ async function fetchSpotTickerData(symbol) {
  * DYNAMIC QUANT ENGINE
  * Generates programmatic strategies using asset velocity spreads & market premium ratios
  */
-function runDynamicQuantEngine(fngValue, currentP2PPrice, btc, eth, bnb, sol, stablecoinParity) {
+function runDynamicQuantEngine(fngValue, currentP2PPrice, btc, eth, bnb, sol, stablecoinParity, btcLongShortRatio, btcFundingRate, solFundingRate) {
   const actions = [];
   const strategyNotes = [];
   let marketContext = "Stable Consolidation";
@@ -236,6 +261,34 @@ function runDynamicQuantEngine(fngValue, currentP2PPrice, btc, eth, bnb, sol, st
     if (stablecoinStress) {
       strategyNotes.push(`Global crypto capital flight is active. Treat local P2P moves as potentially amplified by stablecoin de-peg risk.`);
     }
+  }
+
+  if (btcLongShortRatio !== null) {
+    actions.push(`💼 **BTC Whale Long/Short Ratio:** ${btcLongShortRatio.toFixed(2)}`);
+    if (btcLongShortRatio > 2.0) {
+      strategyNotes.push(`Whales are heavily long-biased. A short-term BTC sell-off is more likely retail panic than structural breakdown.`);
+    } else if (btcLongShortRatio < 0.8) {
+      strategyNotes.push(`Whales are currently net short. Any local P2P strength may be fragile and could reverse if the macro trend weakens.`);
+    }
+  }
+
+  const fundingWarnings = [];
+  if (btcFundingRate !== null) {
+    actions.push(`🔥 **BTC Funding Rate:** ${(btcFundingRate * 100).toFixed(3)}% per 8h`);
+    if (btcFundingRate > FUNDING_RATE_WARNING_THRESHOLD) {
+      fundingWarnings.push(`BTC funding rate is elevated above ${(FUNDING_RATE_WARNING_THRESHOLD * 100).toFixed(3)}%. This suggests long-side leverage stress and a higher chance of liquidation cascades.`);
+    }
+  }
+  if (solFundingRate !== null) {
+    actions.push(`🔥 **SOL Funding Rate:** ${(solFundingRate * 100).toFixed(3)}% per 8h`);
+    if (solFundingRate > FUNDING_RATE_WARNING_THRESHOLD) {
+      fundingWarnings.push(`SOL funding rate is elevated above ${(FUNDING_RATE_WARNING_THRESHOLD * 100).toFixed(3)}%. High perpetual funding signals risky long-side speculation.`);
+    }
+  }
+  if (fundingWarnings.length > 0) {
+    marketContext = 'Funding-Rate Driven Risk';
+    strategyNotes.push(`Wait for funding rate decompression before accumulating. High funding means leveraged longs may be flushed and cheaper P2P levels could arrive within hours.`);
+    strategyNotes.push(...fundingWarnings);
   }
 
   if (currentP2PPrice) {
@@ -442,13 +495,16 @@ async function sendInstantSummary() {
     const fngIndexText = fngData ? `${fngData.value} (${fngData.classification})` : 'Data Unavailable';
     const marketData = lastKnownMarketData;
 
-    const [btc, eth, bnb, sol, avgSellPrice, stablecoinParity] = await Promise.all([
+    const [btc, eth, bnb, sol, avgSellPrice, stablecoinParity, btcLongShortRatio, btcFundingRate, solFundingRate] = await Promise.all([
       fetchSpotTickerData('BTCUSDT'),
       fetchSpotTickerData('ETHUSDT'),
       fetchSpotTickerData('BNBUSDT'),
       fetchSpotTickerData('SOLUSDT'),
       calculateHighestSellPrice(),
-      fetchStablecoinParity()
+      fetchStablecoinParity(),
+      fetchLongShortRatio('BTCUSDT'),
+      fetchFundingRate('BTCUSDT'),
+      fetchFundingRate('SOLUSDT')
     ]);
 
     const formatDisplay = (data, isBtc) => {
@@ -487,7 +543,7 @@ async function sendInstantSummary() {
 
     const fngValue = fngData ? fngData.value : 50; 
     const p2pPriceRaw = marketData ? marketData.price : null;
-    const advice = runDynamicQuantEngine(fngValue, p2pPriceRaw, btc, eth, bnb, sol, stablecoinParity);
+    const advice = runDynamicQuantEngine(fngValue, p2pPriceRaw, btc, eth, bnb, sol, stablecoinParity, btcLongShortRatio, btcFundingRate, solFundingRate);
 
     const summaryMessage = [
       `📊 **DYNAMIC QUANT REPORT**`,
@@ -495,6 +551,9 @@ async function sendInstantSummary() {
       `📉 **Instant Lowest P2P Buy:** ${p2pBuyText}`,
       `📈 **Highest P2P Sell (Cash-Out):** ${sellPriceText}`,
       `🔗 **USDC/USDT Parity:** ${stablecoinParity ? stablecoinParity.toFixed(4) : 'Fetch Error'}`,
+      `📈 **BTC Long/Short Ratio:** ${btcLongShortRatio !== null ? btcLongShortRatio.toFixed(2) : 'Fetch Error'}`,
+      `🔥 **BTC Funding Rate:** ${btcFundingRate !== null ? (btcFundingRate * 100).toFixed(3) + '%' : 'Fetch Error'}`,
+      `🔥 **SOL Funding Rate:** ${solFundingRate !== null ? (solFundingRate * 100).toFixed(3) + '%' : 'Fetch Error'}`,
       `🎭 **Crypto Fear & Greed:** ${fngIndexText}`,
       `🎯 **Active Alert Target:** Under ${TARGET_PRICE} VND`,
       `==============================`,
