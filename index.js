@@ -13,14 +13,17 @@ const BINANCE_P2P_URL = 'https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/se
 const FEAR_GREED_URL = 'https://api.alternative.me/fng/';
 const BINANCE_24HR_TICKER_URL = 'https://api.binance.com/api/v3/ticker/24hr';
 
+// Global memory state
 let lastKnownMarketData = null;
+const adNotificationTracker = new Map(); // Tracks unique ad alerts -> Map(advNo => count)
+const MAX_ALERTS_PER_AD = 3;
 
 /**
  * Robust fetcher wrapper with Exponential Backoff for 429 Handling
  */
 async function fetchWithRetry(url, data, headers, retries = 3, delay = 2000) {
   try {
-    return await axios.post(url, data, { headers });
+    return await axios.post(url, data, { headers, timeout: 8000 });
   } catch (error) {
     if (error.response && error.response.status === 429 && retries > 0) {
       console.warn(`⚠️ [429 Throttled] Binance rate limit hit. Retrying in ${delay / 1000}s... (${retries} attempts left)`);
@@ -32,9 +35,9 @@ async function fetchWithRetry(url, data, headers, retries = 3, delay = 2000) {
 }
 
 /**
- * Reusable helper to pull top active rate from Binance with targeted merchant filter
+ * Enhanced data fetcher pulling ALL peer ads by removing "publisherType"
  */
-async function fetchCurrentP2PPrice() {
+async function fetchP2POrderBook() {
   const payload = {
     "asset": "USDT",
     "fiat": "VND",
@@ -43,26 +46,29 @@ async function fetchCurrentP2PPrice() {
     "rows": 10,
     "payTypes": [],
     "countries": [],
-    "publisherType": "merchant",
     "proMerchantAds": false,
     "shieldMerchantAds": false
   };
 
   const headers = {
     'Content-Type': 'application/json',
-    'Accept': 'application/json',
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    'Accept': '*/*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Origin': 'https://p2p.binance.com',
+    'Referer': 'https://p2p.binance.com/en/trade/all-payments/USDT?fiat=VND',
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Sec-Ch-Ua': '"Chromium";v="124", "Google Chrome";v="124"',
+    'Sec-Ch-Ua-Mobile': '?0',
+    'Sec-Ch-Ua-Platform': '"macOS"',
+    'Sec-Fetch-Dest': 'empty',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Site': 'same-origin'
   };
 
   try {
     const response = await fetchWithRetry(BINANCE_P2P_URL, payload, headers);
     if (!response?.data?.data || response.data.data.length === 0) return null;
-
-    const topAd = response.data.data[0];
-    return {
-      price: parseFloat(topAd.adv.price),
-      merchant: topAd.advertiser.nickName
-    };
+    return response.data.data;
   } catch (error) {
     console.error('P2P Fetch Error:', error.message);
     return null;
@@ -111,11 +117,10 @@ async function fetchSpotTickerData(symbol) {
 /**
  * Algorithmic rule engine determining action items based on market state
  */
-function generateExpertSuggestion(fngValue, btc, eth, bnb) {
+function generateExpertSuggestion(fngValue, btc, eth, bnb, sol) {
   let actions = [];
   let marketContext = "Neutral/Consolidation";
 
-  // 1. Evaluate Macro Sentiment
   if (fngValue <= 25) {
     marketContext = "Extreme Fear (High Value Buying Zone)";
     actions.push("💎 **BUY ACCUMULATION:** Historically, an FnG below 25 is the optimal window to scale into BTC spot. Avoid leverage, build long-term positions.");
@@ -124,24 +129,27 @@ function generateExpertSuggestion(fngValue, btc, eth, bnb) {
     actions.push("🚨 **TAKE PROFIT / HOLD CASH:** Retail FOMO is peaking. Consider scaling out 10-15% of your altcoin positions into USDT using your P2P alert targets.");
   }
 
-  // 2. Relative Strength & Rotation Assessment (BTC vs ETH/BNB)
   if (btc && eth && bnb) {
-    const ethBtcRatio = eth.rawPrice / btc.rawPrice;
-    
-    // Check if Altcoins are showing relative strength or bleeding against BTC
     if (eth.rawChange > btc.rawChange + 1.5) {
       actions.push("🔄 **ALT ROTATION:** ETH is outperforming BTC over 24h. If the ETH/BTC ratio breaks local resistance, short-term momentum favors high-cap layer-1s like ETH and BNB.");
     } else if (btc.rawChange > eth.rawChange + 1.0) {
-      actions.push("🛡️ **FLIGHT TO QUALITY:** BTC is absorbing market liquidity while ETH bleeds on the ratio. **Hold or Buy BTC** over alts right now; it remains the preferred corporate asset.");
+      actions.push("🛡️ **FLIGHT TO QUALITY:** BTC is absorbing market liquidity while ETH bleeds on the ratio. **Hold or Buy BTC** over alts right now.");
     }
 
-    // Specific Ecosystem Catalyst Rule (e.g., BNB ETF/AI Narrative speculation)
     if (bnb.rawChange > 5.0) {
       actions.push("🟨 **BNB MOMENTUM:** BNB is showing sudden vertical strength. If you hold short-term trade bags, lock in partial profits or trail your stop-loss closely.");
     }
   }
 
-  // Fallback default action item if market is flat
+  // ENHANCEMENT: Added automated strategy evaluation rule for Solana ecosystem activity
+  if (sol && btc) {
+    if (sol.rawChange > btc.rawChange + 3.0) {
+      actions.push("🚀 **SOLANA MOMENTUM:** SOL is displaying high relative strength compared to BTC. Expect heightened on-chain volume and potential price action spikes across SPL ecosystem tokens.");
+    } else if (btc.rawChange > sol.rawChange + 4.0) {
+      actions.push("🩸 **SOL BLEEDING:** SOL is dropping faster than the macro market trend. This could offer localized scale-in opportunities if historical support ranges hold.");
+    }
+  }
+
   if (actions.length === 0) {
     actions.push("⏱️ **PATIENCE:** Market structure shows low-volatility consolidation. Keep your powder dry in USDT. Do not chase minor intra-day movements.");
   }
@@ -153,30 +161,64 @@ function generateExpertSuggestion(fngValue, btc, eth, bnb) {
 }
 
 /**
+ * Maintenance sweep to keep tracking Map clean and prevent memory leaks over long uptimes
+ */
+function purgeOldCacheTrackingRecords() {
+  if (adNotificationTracker.size > 500) {
+    console.log(`🧹 Cache maintenance: Pruning old tracking indexes...`);
+    const trackingKeys = Array.from(adNotificationTracker.keys());
+    for (let i = 0; i < 150; i++) {
+      adNotificationTracker.delete(trackingKeys[i]);
+    }
+  }
+}
+
+/**
  * Combined threshold agent evaluating local price targets and macro extreme fear signals
  */
 async function monitorThreshold() {
   try {
-    const marketData = await fetchCurrentP2PPrice();
-    if (marketData) lastKnownMarketData = marketData;
+    const adList = await fetchP2POrderBook();
+    if (!adList || adList.length === 0) return;
+
+    lastKnownMarketData = {
+      price: parseFloat(adList[0].adv.price),
+      merchant: adList[0].advertiser.nickName
+    };
 
     const fngData = await fetchFearAndGreedData();
     const fngValueText = fngData ? `${fngData.value} (${fngData.classification})` : 'Data Unavailable';
 
-    console.log(`[${new Date().toLocaleTimeString()}] Audit -> P2P: ${marketData?.price || 'ERR'} VND | FnG: ${fngValueText}`);
+    console.log(`[${new Date().toLocaleTimeString()}] Audit -> Top P2P: ${lastKnownMarketData.price} VND | FnG: ${fngValueText}`);
 
-    if (marketData && marketData.price <= TARGET_PRICE) {
-      if (TARGET_PRICE > 30000) {
-        console.error(`⚠️ [Configuration Alert] Your TARGET_PRICE (${TARGET_PRICE}) configuration exceeds standard thresholds. Skipping notification to prevent spam.`);
-        return;
-      }
+    for (const entry of adList) {
+      const price = parseFloat(entry.adv.price);
+      const merchant = entry.advertiser.nickName;
+      const advNo = entry.adv.advNo;
 
-      let alertMessage = `⚠️ **P2P TARGET REACHED** @everyone\n> 💰 **Price:** ${marketData.price} VND\n> 👤 **Merchant:** ${marketData.merchant}\n> 🎯 **Target Set:** Under ${TARGET_PRICE} VND`;
-      
-      if (fngData) {
-        alertMessage += `\n> 🎭 **Current Crypto Sentiment:** ${fngValueText}`;
+      if (price <= TARGET_PRICE) {
+        if (TARGET_PRICE > 30000) {
+          console.error(`⚠️ [Configuration Alert] Your TARGET_PRICE (${TARGET_PRICE}) exceeds safety limits. Skipping execution.`);
+          return;
+        }
+
+        const currentAlertCount = adNotificationTracker.get(advNo) || 0;
+
+        if (currentAlertCount < MAX_ALERTS_PER_AD) {
+          const nextCountState = currentAlertCount + 1;
+          adNotificationTracker.set(advNo, nextCountState);
+
+          console.log(`⚡ Match targeted! Ad ${advNo} meets conditions. Alert Count: [${nextCountState}/${MAX_ALERTS_PER_AD}]`);
+          
+          let alertMessage = `⚠️ **P2P TARGET REACHED** @everyone\n> 💰 **Price:** ${price} VND\n> 👤 **User:** ${merchant}\n> 🆔 **Ad No:** ${advNo}\n> 🎯 **Target Set:** Under ${TARGET_PRICE} VND`;
+          if (fngData) {
+            alertMessage += `\n> 🎭 **Current Crypto Sentiment:** ${fngValueText}`;
+          }
+          
+          await sendDiscordNotification(alertMessage);
+          break; 
+        }
       }
-      await sendDiscordNotification(alertMessage);
     }
 
     if (fngData && fngData.value < 25) {
@@ -185,6 +227,8 @@ async function monitorThreshold() {
                              `> 💡 *Historical Data Rule: This represents an optimal accumulation window for long-term spot positions.*`;
       await sendDiscordNotification(warningMessage);
     }
+
+    purgeOldCacheTrackingRecords();
 
   } catch (error) {
     console.error('Threshold Monitor Cycle Error:', error.message);
@@ -202,14 +246,14 @@ async function sendInstantSummary() {
     const fngIndexText = fngData ? `${fngData.value} (${fngData.classification})` : 'Data Unavailable';
     const marketData = lastKnownMarketData;
 
-    // Fetch spot ticker metrics concurrently
-    const [btc, eth, bnb] = await Promise.all([
+    // ENHANCEMENT: Included SOLUSDT in the concurrent pipeline resolution array
+    const [btc, eth, bnb, sol] = await Promise.all([
       fetchSpotTickerData('BTCUSDT'),
       fetchSpotTickerData('ETHUSDT'),
-      fetchSpotTickerData('BNBUSDT')
+      fetchSpotTickerData('BNBUSDT'),
+      fetchSpotTickerData('SOLUSDT')
     ]);
 
-    // Format output strings safely
     const formatDisplay = (data, isBtc) => {
       if (!data) return { text: 'Fetch Err', indicator: '❌' };
       const formattedPrice = isBtc 
@@ -225,16 +269,17 @@ async function sendInstantSummary() {
     const btcDisplay = formatDisplay(btc, true);
     const ethDisplay = formatDisplay(eth, false);
     const bnbDisplay = formatDisplay(bnb, false);
+    const solDisplay = formatDisplay(sol, false); // ENHANCEMENT: Format output descriptor references
 
     let p2pText = 'No recent data collected';
     if (marketData) {
-      p2pText = `**${marketData.price} VND** (Merchant: ${marketData.merchant})`;
+      p2pText = `**${marketData.price} VND** (User: ${marketData.merchant})`;
     }
 
-    // Run programmatic data variables through our logic rules engine
     const fngValue = fngData ? fngData.value : 50; 
-    const advice = generateExpertSuggestion(fngValue, btc, eth, bnb);
+    const advice = generateExpertSuggestion(fngValue, btc, eth, bnb, sol);
 
+    // ENHANCEMENT: Updated the final string interpolation layout payload to cleanly append Solana index records
     const summaryMessage = `📊 **MARKET UPDATE SUMMARY**\n` +
                            `==============================\n` +
                            `📉 **Instant Lowest P2P:** ${p2pText}\n` +
@@ -245,6 +290,7 @@ async function sendInstantSummary() {
                            `> ${btcDisplay.indicator} **BTC:** ${btcDisplay.text}\n` +
                            `> ${ethDisplay.indicator} **ETH:** ${ethDisplay.text}\n` +
                            `> ${bnbDisplay.indicator} **BNB:** ${bnbDisplay.text}\n` +
+                           `> ${solDisplay.indicator} **SOL:** ${solDisplay.text}\n` +
                            `==============================\n` +
                            `🧠 **AI / EXPERT STRATEGY SUGGESTION:**\n` +
                            `> 📋 **Market State Context:** *${advice.context}*\n` +
@@ -281,10 +327,7 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`📡 Production engine live on port ${PORT}`);
-  console.log(`🎯 Target Threshold: ${TARGET_PRICE} VND`);
-  console.log(`⏱️  Check Loop: Every ${process.env.MONITOR_INTERVAL_MIN || 1} min | Report Loop: Every ${process.env.SUMMARY_INTERVAL_MIN || 10} min`);
-  
+  console.log(`Base Server -> Operational Engine Online on Port: ${PORT}`);
   monitorThreshold(); 
   setInterval(monitorThreshold, MONITOR_INTERVAL_MS);
   setInterval(sendInstantSummary, SUMMARY_INTERVAL_MS);
