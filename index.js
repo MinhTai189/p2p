@@ -187,7 +187,7 @@ async function monitorThreshold() {
       const minTrans = Number(entry.adv.minSingleTransAmount);
       const maxTrans = Number(entry.adv.maxSingleTransAmount);
       
-      return minTrans >= MIN_SINGLE_TRANS_AMOUNT && maxTrans <= MAX_SINGLE_TRANS_AMOUNT;
+      return maxTrans >= MAX_SINGLE_TRANS_AMOUNT;
     });
 
     if (filteredAds.length === 0) {
