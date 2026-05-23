@@ -22,7 +22,9 @@ const MAX_HISTORY_WINDOW_MS = TRACKING_WINDOW_MIN * 60 * 1000;
 const BINANCE_P2P_URL = 'https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search';
 const FEAR_GREED_URL = 'https://api.alternative.me/fng/';
 const BINANCE_24HR_TICKER_URL = 'https://api.binance.com/api/v3/ticker/24hr';
+const BINANCE_STABLECOIN_PARITY_URL = 'https://api.binance.com/api/v3/ticker/price?symbol=USDCUSDT';
 const IMPLIED_GLOBAL_USD_VND = Number(process.env.IMPLIED_GLOBAL_USD_VND) || 25420;
+const STABLECOIN_DEPEG_THRESHOLD = Number(process.env.STABLECOIN_DEPEG_THRESHOLD) || 0.002;
 
 // Global memory state
 let lastKnownMarketData = null;
@@ -102,6 +104,16 @@ async function calculateHighestSellPrice() {
   const totalSum = targetBatch.reduce((sum, entry) => sum + parseFloat(entry.adv.price), 0);
   
   return totalSum / targetBatch.length;
+}
+
+async function fetchStablecoinParity() {
+  try {
+    const response = await axios.get(BINANCE_STABLECOIN_PARITY_URL, { timeout: 5000 });
+    return parseFloat(response.data.price);
+  } catch (error) {
+    console.error('❌ Stablecoin Parity Fetch Error:', error.message);
+    return null;
+  }
 }
 
 async function fetchFearAndGreedData() {
@@ -212,22 +224,43 @@ async function fetchSpotTickerData(symbol) {
  * DYNAMIC QUANT ENGINE
  * Generates programmatic strategies using asset velocity spreads & market premium ratios
  */
-function runDynamicQuantEngine(fngValue, currentP2PPrice, btc, eth, bnb, sol) {
+function runDynamicQuantEngine(fngValue, currentP2PPrice, btc, eth, bnb, sol, stablecoinParity) {
   const actions = [];
   const strategyNotes = [];
   let marketContext = "Stable Consolidation";
+  const stablecoinDeviation = stablecoinParity ? Math.abs(stablecoinParity - 1) : 0;
+  const stablecoinStress = stablecoinDeviation >= STABLECOIN_DEPEG_THRESHOLD;
+
+  if (stablecoinParity) {
+    actions.push(`🔗 **Stablecoin Parity Check:** USDC/USDT = ${stablecoinParity.toFixed(4)} (${(stablecoinDeviation * 100).toFixed(2)}% from peg)`);
+    if (stablecoinStress) {
+      strategyNotes.push(`Global crypto capital flight is active. Treat local P2P moves as potentially amplified by stablecoin de-peg risk.`);
+    }
+  }
 
   if (currentP2PPrice) {
     const premiumRatio = ((currentP2PPrice / IMPLIED_GLOBAL_USD_VND) - 1) * 100;
     
     if (premiumRatio > 2.5) {
-      marketContext = "High Domestic Capital Flight";
-      actions.push(`⚠️ **P2P OVERPRICED (+${premiumRatio.toFixed(2)}% Premium):** Local demand for stablecoins is heavily decoupled from global rates. High risk of local capital exhaustion. Consider pausing heavy buy orders.`);
-      strategyNotes.push(`Avoid adding new P2P buys at this premium. Look for premium contraction or use hedged positions while preserving capital.`);
+      if (stablecoinStress) {
+        marketContext = "Global Stablecoin-Driven Stress";
+        actions.push(`⚠️ **P2P OVERPRICED (+${premiumRatio.toFixed(2)}% Premium):** Local premium is likely amplified by global stablecoin dislocation rather than only Vietnamese demand.`);
+        strategyNotes.push(`Reduce position size and avoid aggressive P2P accumulation until stablecoin parity stabilizes.`);
+      } else {
+        marketContext = "High Domestic Capital Flight";
+        actions.push(`⚠️ **P2P OVERPRICED (+${premiumRatio.toFixed(2)}% Premium):** Local demand for stablecoins is heavily decoupled from global rates. High risk of local capital exhaustion. Consider pausing heavy buy orders.`);
+        strategyNotes.push(`Avoid adding new P2P buys at this premium. Look for premium contraction or use hedged positions while preserving capital.`);
+      }
     } else if (premiumRatio < -0.5) {
-      marketContext = "Domestic Capital Capitulation";
-      actions.push(`💎 **P2P UNDERPRICED (${premiumRatio.toFixed(2)}% Discount):** P2P is trading below global spot parity. Excellent cash-to-crypto fiat entry window via localized market mispricings.`);
-      strategyNotes.push(`Aggressively consider accumulation with small, repeated buys. This is a favorable entry window for structured DCA into risk assets.`);
+      if (stablecoinStress) {
+        marketContext = "Global Stablecoin-Coupled Discount";
+        actions.push(`💎 **P2P UNDERPRICED (${premiumRatio.toFixed(2)}% Discount):** Local P2P markets may be reflecting global stablecoin stress rather than purely local supply.`);
+        strategyNotes.push(`Carry out selective buys, but keep exposure limited while global stablecoin risk remains elevated.`);
+      } else {
+        marketContext = "Domestic Capital Capitulation";
+        actions.push(`💎 **P2P UNDERPRICED (${premiumRatio.toFixed(2)}% Discount):** P2P is trading below global spot parity. Excellent cash-to-crypto fiat entry window via localized market mispricings.`);
+        strategyNotes.push(`Aggressively consider accumulation with small, repeated buys. This is a favorable entry window for structured DCA into risk assets.`);
+      }
     } else {
       strategyNotes.push(`P2P price is within a neutral premium band. Favor disciplined position sizing, and treat any trade as tactical rather than directional.`);
     }
@@ -409,12 +442,13 @@ async function sendInstantSummary() {
     const fngIndexText = fngData ? `${fngData.value} (${fngData.classification})` : 'Data Unavailable';
     const marketData = lastKnownMarketData;
 
-    const [btc, eth, bnb, sol, avgSellPrice] = await Promise.all([
+    const [btc, eth, bnb, sol, avgSellPrice, stablecoinParity] = await Promise.all([
       fetchSpotTickerData('BTCUSDT'),
       fetchSpotTickerData('ETHUSDT'),
       fetchSpotTickerData('BNBUSDT'),
       fetchSpotTickerData('SOLUSDT'),
-      calculateHighestSellPrice()
+      calculateHighestSellPrice(),
+      fetchStablecoinParity()
     ]);
 
     const formatDisplay = (data, isBtc) => {
@@ -453,13 +487,14 @@ async function sendInstantSummary() {
 
     const fngValue = fngData ? fngData.value : 50; 
     const p2pPriceRaw = marketData ? marketData.price : null;
-    const advice = runDynamicQuantEngine(fngValue, p2pPriceRaw, btc, eth, bnb, sol);
+    const advice = runDynamicQuantEngine(fngValue, p2pPriceRaw, btc, eth, bnb, sol, stablecoinParity);
 
     const summaryMessage = [
       `📊 **DYNAMIC QUANT REPORT**`,
       `==============================`,
       `📉 **Instant Lowest P2P Buy:** ${p2pBuyText}`,
       `📈 **Highest P2P Sell (Cash-Out):** ${sellPriceText}`,
+      `🔗 **USDC/USDT Parity:** ${stablecoinParity ? stablecoinParity.toFixed(4) : 'Fetch Error'}`,
       `🎭 **Crypto Fear & Greed:** ${fngIndexText}`,
       `🎯 **Active Alert Target:** Under ${TARGET_PRICE} VND`,
       `==============================`,
