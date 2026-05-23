@@ -466,6 +466,7 @@ function purgeOldCacheTrackingRecords() {
  * Threshold Verification Engine Loop
  */
 async function monitorThreshold() {
+  console.log(`[${new Date().toISOString()}] monitorThreshold() start`);
   try {
     const fngData = await fetchFearAndGreedData();
     if (fngData) {
@@ -624,6 +625,7 @@ async function monitorThreshold() {
     }
 
     purgeOldCacheTrackingRecords();
+    console.log(`[${new Date().toISOString()}] monitorThreshold() end`);
   } catch (error) {
     console.error('❌ Threshold Monitor Cycle Error:', error.message);
   }
@@ -633,6 +635,7 @@ async function monitorThreshold() {
  * Summary Displayer
  */
 async function sendInstantSummary() {
+  console.log(`[${new Date().toISOString()}] sendInstantSummary() start`);
   try {
     const fngData = await fetchFearAndGreedData();
     const fngIndexText = fngData ? `${fngData.value} (${fngData.classification})` : 'Data Unavailable';
@@ -735,15 +738,23 @@ async function sendInstantSummary() {
     ].join('\n');
 
     await sendDiscordNotification(summaryMessage);
+    console.log(`[${new Date().toISOString()}] sendInstantSummary() dispatched summary`);
   } catch (error) {
     console.error('❌ Failed to compile dynamic summary snapshot:', error.message);
   }
 }
 
 async function sendDiscordNotification(messageText) {
-  if (!DISCORD_WEBHOOK_URL) return;
+  if (!DISCORD_WEBHOOK_URL) {
+    console.log(`[${new Date().toISOString()}] sendDiscordNotification skipped: DISCORD_WEBHOOK_URL not set`);
+    return;
+  }
   try {
-    await axios.post(DISCORD_WEBHOOK_URL, { content: messageText }, { timeout: 5000 });
+    const ts = new Date().toISOString();
+    const payload = { content: `[${ts}]\n${messageText}` };
+    console.log(`[${ts}] sendDiscordNotification -> dispatching (trunc): ${String(messageText).slice(0,120).replace(/\n/g,' ')}...`);
+    const resp = await axios.post(DISCORD_WEBHOOK_URL, payload, { timeout: 5000 });
+    console.log(`[${new Date().toISOString()}] sendDiscordNotification -> delivered, status: ${resp.status}`);
   } catch (error) {
     console.error('❌ Discord Delivery Failure:', error.message);
   }
