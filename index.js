@@ -9,8 +9,8 @@ const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 const TARGET_PRICE = Number(process.env.TARGET_PRICE) || 26300;
 
 // Execution intervals
-const MONITOR_INTERVAL_MS = 60000;       // Check every 1 minute
-const SUMMARY_INTERVAL_MS = 10 * 60000;  // Send interval summary every 10 minutes
+const MONITOR_INTERVAL_MS = Number(process.env.MONITOR_INTERVAL_MS) * 60000;       // Check every 1 minute
+const SUMMARY_INTERVAL_MS = Number(process.env.SUMMARY_INTERVAL_MS) * 60000;  // Send interval summary every 10 minutes
 
 const BINANCE_P2P_URL = 'https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search';
 const FEAR_GREED_URL = 'https://api.alternative.me/fng/';
