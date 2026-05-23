@@ -757,7 +757,7 @@ async function sendDiscordNotification(messageText) {
   }
 
   try {
-    const ts = new Date().toISOString();
+    const ts = new Date().toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
     
     // Sửa lỗi 1: Giới hạn ký tự an toàn dưới 2000
     const maxChars = 1900; 
