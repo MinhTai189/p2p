@@ -293,7 +293,7 @@ async function monitorThreshold() {
           : 'Data Unavailable';
 
         const fngWarningMessage = [
-          `🚨 **CRITICAL MACRO WARNING: EXTREME FEAR** 🚨`,
+          `🚨 **CRITICAL MACRO WARNING: EXTREME FEAR** @everyone🚨`,
           `==============================`,
           `🎭 **Fear & Greed Index dropped to:** **${fngValue}** (${fngData.classification})`,
           `💰 **Highest Cash-Out Sell Price:** ${sellPriceText}`,
@@ -351,7 +351,7 @@ async function monitorThreshold() {
           adNotificationTracker.set(advNo, currentAlertCount + 1);
 
           const alertMessage = [
-            `⚠️ **P2P TARGET REACHED**`,
+            `⚠️ **P2P TARGET REACHED @everyone**`,
             `> 💰 **Buy Price:** ${price} VND`,
             `> 👤 **Merchant:** ${merchant}`,
             `> 🆔 **Ad No:** ${advNo}`,
