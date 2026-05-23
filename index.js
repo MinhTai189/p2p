@@ -749,14 +749,41 @@ async function sendDiscordNotification(messageText) {
     console.log(`[${new Date().toISOString()}] sendDiscordNotification skipped: DISCORD_WEBHOOK_URL not set`);
     return;
   }
+
+  // Sửa lỗi 2: Kiểm tra tin nhắn rỗng
+  if (!messageText || String(messageText).trim() === "") {
+    console.error(`[${new Date().toISOString()}] sendDiscordNotification error: messageText is empty`);
+    return;
+  }
+
   try {
     const ts = new Date().toISOString();
-    const payload = { content: `[${ts}]\n${messageText}` };
-    console.log(`[${ts}] sendDiscordNotification -> dispatching (trunc): ${String(messageText).slice(0,120).replace(/\n/g,' ')}...`);
-    const resp = await axios.post(DISCORD_WEBHOOK_URL, payload, { timeout: 5000 });
+    
+    // Sửa lỗi 1: Giới hạn ký tự an toàn dưới 2000
+    const maxChars = 1900; 
+    let safeText = String(messageText);
+    if (safeText.length > maxChars) {
+      safeText = safeText.slice(0, maxChars) + "\n...(Tin nhắn quá dài đã bị cắt bớt)...";
+    }
+
+    const payload = { content: `[${ts}]\n${safeText}` };
+    
+    console.log(`[${ts}] sendDiscordNotification -> dispatching (trunc): ${safeText.slice(0,120).replace(/\n/g,' ')}...`);
+    
+    // Sửa lỗi 3: Thêm Headers tường minh
+    const resp = await axios.post(DISCORD_WEBHOOK_URL, payload, { 
+      timeout: 5000,
+      headers: { 'Content-Type': 'application/json' }
+    });
+    
     console.log(`[${new Date().toISOString()}] sendDiscordNotification -> delivered, status: ${resp.status}`);
   } catch (error) {
-    console.error('❌ Discord Delivery Failure:', error.message);
+    // Đoạn này giúp bạn nhìn rõ Discord đang mắng bạn vì lỗi gì (ví dụ: chi tiết lỗi trong error.response.data)
+    if (error.response) {
+      console.error('❌ Discord API Error Details:', JSON.stringify(error.response.data));
+    } else {
+      console.error('❌ Discord Delivery Failure:', error.message);
+    }
   }
 }
 
