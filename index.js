@@ -1,6 +1,7 @@
 const axios = require('axios');
 const http = require('http');
 require('dotenv').config();
+const { XMLParser } = require('fast-xml-parser');
 
 const PORT = process.env.PORT || 3000;
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
@@ -30,6 +31,7 @@ const LIVE_EXCHANGE_RATE_URL = 'https://open.er-api.com/v6/latest/USD';
 const IMPLIED_GLOBAL_USD_VND = Number(process.env.IMPLIED_GLOBAL_USD_VND) || 25420;
 const STABLECOIN_DEPEG_THRESHOLD = Number(process.env.STABLECOIN_DEPEG_THRESHOLD) || 0.002;
 const FUNDING_RATE_WARNING_THRESHOLD = Number(process.env.FUNDING_RATE_WARNING_THRESHOLD) || 0.0005;
+const VCB_XML_URL = 'https://portal.vietcombank.com.vn/Usercontrols/TVPortal.TyGia/pXML.aspx';
 
 // Track downtrend warnings to avoid duplicate messages per day: key -> `${date}:${symbol}:${level}`
 const downtrendAlertTracker = new Set();
@@ -169,12 +171,52 @@ async function fetchFundingRate(symbol = 'BTCUSDT') {
 }
 
 async function fetchLiveExchangeRate() {
+  // --- TRY STRATEGY 1: VIETCOMBANK (Most accurate local retail rate) ---
   try {
+    console.log(`[${new Date().toISOString()}] Attempting Vietcombank exchange rate fetch...`);
+    
+    const response = await axios.get(VCB_XML_URL, { 
+      timeout: 5000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+      }
+    });
+
+    const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "" });
+    const jsonObj = parser.parse(response.data);
+    const rates = jsonObj.ExrateList?.Exrate;
+
+    if (Array.isArray(rates)) {
+      const usdData = rates.find(item => item.CurrencyCode === 'USD');
+      if (usdData && usdData.Sell) {
+        // Strip string commas (e.g., "26,390.00" -> 26390.00)
+        const vcbVndRate = parseFloat(usdData.Sell.replace(/,/g, ''));
+        
+        if (Number.isFinite(vcbVndRate) && vcbVndRate > 0) {
+          console.log(`✅ Success: Pulled clean rate from Vietcombank (${vcbVndRate} VND)`);
+          return vcbVndRate;
+        }
+      }
+    }
+    console.warn('⚠️ Vietcombank parsed payload did not contain valid USD structural fields.');
+  } catch (vcbError) {
+    console.error('❌ Vietcombank Direct Fetch Failed:', vcbError.message);
+  }
+
+  // --- TRY STRATEGY 2: LIVE_EXCHANGE_RATE_URL FALLBACK ---
+  try {
+    console.log(`[${new Date().toISOString()}] Executing fallback to global macro engine...`);
+    
     const response = await axios.get(LIVE_EXCHANGE_RATE_URL, { timeout: 5000 });
     const vndRate = parseFloat(response.data?.rates?.VND);
-    return Number.isFinite(vndRate) ? vndRate : null;
-  } catch (error) {
-    console.error('❌ Live Exchange Rate Fetch Error:', error.message);
+    
+    if (Number.isFinite(vndRate)) {
+      console.log(`ℹ️ Fallback Success: Using Global API Baseline (${vndRate} VND)`);
+      return vndRate;
+    }
+    return null;
+  } catch (fallbackError) {
+    console.error('❌ Fallback Macro Exchange Rate Fetch Error:', fallbackError.message);
     return null;
   }
 }
@@ -858,6 +900,9 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, () => {
   console.log(`🚀 Server executing tracking workflows on port ${PORT}`);
+
+  fetchLiveExchangeRate()
+  return
   
   monitorThreshold();
   
