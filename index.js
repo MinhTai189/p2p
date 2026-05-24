@@ -74,6 +74,10 @@ function isVnQuietHours() {
   return vnHour >= 23 || vnHour < 6;
 }
 
+function logApiCall(apiName, url, summary) {
+  const timestamp = new Date().toISOString();
+  console.log(`[${timestamp}] API CALL | ${apiName} | ${summary} | ${url}`);
+}
 
 /**
  * Robust fetcher wrapper with Exponential Backoff
@@ -116,11 +120,16 @@ async function fetchP2POrderBook(tradeType = "BUY") {
     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
   };
 
+  const url = BINANCE_P2P_URL;
+  logApiCall('Binance P2P Order Book', url, `tradeType=${tradeType} start`);
   try {
-    const response = await fetchWithRetry(BINANCE_P2P_URL, payload, headers);
+    const response = await fetchWithRetry(url, payload, headers);
+    const resultCount = Array.isArray(response?.data?.data) ? response.data.data.length : 0;
+    logApiCall('Binance P2P Order Book', url, `tradeType=${tradeType} success, ads=${resultCount}`);
     return response?.data?.data || null;
   } catch (error) {
     console.error(`❌ P2P Fetch Error (${tradeType}):`, error.message);
+    logApiCall('Binance P2P Order Book', url, `tradeType=${tradeType} failed: ${error.message}`);
     return null;
   }
 }
@@ -139,38 +148,55 @@ async function calculateHighestSellPrice() {
 }
 
 async function fetchStablecoinParity() {
+  const url = BINANCE_STABLECOIN_PARITY_URL;
+  logApiCall('Binance USDC/USDT Parity', url, 'start');
   try {
-    const response = await axios.get(BINANCE_STABLECOIN_PARITY_URL, { timeout: 5000 });
-    return parseFloat(response.data.price);
+    const response = await axios.get(url, { timeout: 5000 });
+    const parity = parseFloat(response.data.price);
+    logApiCall('Binance USDC/USDT Parity', url, `success, parity=${parity}`);
+    return parity;
   } catch (error) {
     console.error('❌ Stablecoin Parity Fetch Error:', error.message);
+    logApiCall('Binance USDC/USDT Parity', url, `failed: ${error.message}`);
     return null;
   }
 }
 
 async function fetchLongShortRatio(symbol = 'BTCUSDT') {
+  const url = `${BINANCE_LONG_SHORT_RATIO_URL_BASE}?symbol=${symbol}&period=5m&limit=1`;
+  logApiCall('Binance Long/Short Ratio', url, 'start');
   try {
-    const response = await axios.get(`${BINANCE_LONG_SHORT_RATIO_URL_BASE}?symbol=${symbol}&period=5m&limit=1`, { timeout: 5000 });
+    const response = await axios.get(url, { timeout: 5000 });
     const ratio = parseFloat(response.data?.[0]?.longShortRatio);
+    const summary = Number.isFinite(ratio) ? `success, ratio=${ratio}` : 'success, ratio=invalid';
+    logApiCall('Binance Long/Short Ratio', url, summary);
     return Number.isFinite(ratio) ? ratio : null;
   } catch (error) {
     console.error('❌ Long/Short Ratio Fetch Error:', error.message);
+    logApiCall('Binance Long/Short Ratio', url, `failed: ${error.message}`);
     return null;
   }
 }
 
 async function fetchFundingRate(symbol = 'BTCUSDT') {
+  const url = `${BINANCE_PREMIUM_INDEX_URL}?symbol=${symbol}`;
+  logApiCall('Binance Funding Rate', url, `start (${symbol})`);
   try {
-    const response = await axios.get(`${BINANCE_PREMIUM_INDEX_URL}?symbol=${symbol}`, { timeout: 5000 });
+    const response = await axios.get(url, { timeout: 5000 });
     const lastFundingRate = parseFloat(response.data?.lastFundingRate);
+    const summary = Number.isFinite(lastFundingRate) ? `success, rate=${lastFundingRate}` : 'success, rate=invalid';
+    logApiCall('Binance Funding Rate', url, summary);
     return Number.isFinite(lastFundingRate) ? lastFundingRate : null;
   } catch (error) {
     console.error(`❌ Funding Rate Fetch Error (${symbol}):`, error.message);
+    logApiCall('Binance Funding Rate', url, `failed: ${error.message}`);
     return null;
   }
 }
 
 async function fetchLiveExchangeRate() {
+  const url = LIVE_EXCHANGE_RATE_URL;
+  logApiCall('Open ER Live USD/VND Rate', url, 'start');
   // --- TRY STRATEGY 1: VIETCOMBANK (Most accurate local retail rate) ---
   try {
     console.log(`[${new Date().toISOString()}] Attempting Vietcombank exchange rate fetch...`);
@@ -189,10 +215,10 @@ async function fetchLiveExchangeRate() {
     if (Array.isArray(rates)) {
       const usdData = rates.find(item => item.CurrencyCode === 'USD');
       if (usdData && usdData.Sell) {
-        // Strip string commas (e.g., "26,390.00" -> 26390.00)
         const vcbVndRate = parseFloat(usdData.Sell.replace(/,/g, ''));
         
         if (Number.isFinite(vcbVndRate) && vcbVndRate > 0) {
+          logApiCall('Vietcombank XML', VCB_XML_URL, `success, rate=${vcbVndRate}`);
           console.log(`✅ Success: Pulled clean rate from Vietcombank (${vcbVndRate} VND)`);
           return vcbVndRate;
         }
@@ -201,32 +227,41 @@ async function fetchLiveExchangeRate() {
     console.warn('⚠️ Vietcombank parsed payload did not contain valid USD structural fields.');
   } catch (vcbError) {
     console.error('❌ Vietcombank Direct Fetch Failed:', vcbError.message);
+    logApiCall('Vietcombank XML', VCB_XML_URL, `failed: ${vcbError.message}`);
   }
 
   // --- TRY STRATEGY 2: LIVE_EXCHANGE_RATE_URL FALLBACK ---
   try {
     console.log(`[${new Date().toISOString()}] Executing fallback to global macro engine...`);
     
-    const response = await axios.get(LIVE_EXCHANGE_RATE_URL, { timeout: 5000 });
+    const response = await axios.get(url, { timeout: 5000 });
     const vndRate = parseFloat(response.data?.rates?.VND);
     
     if (Number.isFinite(vndRate)) {
+      logApiCall('Open ER Live USD/VND Rate', url, `success, rate=${vndRate}`);
       console.log(`ℹ️ Fallback Success: Using Global API Baseline (${vndRate} VND)`);
       return vndRate;
     }
+    logApiCall('Open ER Live USD/VND Rate', url, 'success, rate=invalid');
     return null;
   } catch (fallbackError) {
     console.error('❌ Fallback Macro Exchange Rate Fetch Error:', fallbackError.message);
+    logApiCall('Open ER Live USD/VND Rate', url, `failed: ${fallbackError.message}`);
     return null;
   }
 }
 
 async function fetchKlines(symbol = 'BTCUSDT', interval = '1d', limit = 90) {
+  const url = `${BINANCE_KLINES_URL}?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+  logApiCall('Binance Klines', url, `start, limit=${limit}`);
   try {
-    const response = await axios.get(`${BINANCE_KLINES_URL}?symbol=${symbol}&interval=${interval}&limit=${limit}`, { timeout: 8000 });
-    return Array.isArray(response.data) ? response.data : null;
+    const response = await axios.get(url, { timeout: 8000 });
+    const data = Array.isArray(response.data) ? response.data : null;
+    logApiCall('Binance Klines', url, `success, candles=${data?.length ?? 0}`);
+    return data;
   } catch (error) {
     console.error(`❌ Klines Fetch Error (${symbol} ${interval}):`, error.message);
+    logApiCall('Binance Klines', url, `failed: ${error.message}`);
     return null;
   }
 }
@@ -285,11 +320,12 @@ async function evaluateDowntrend(symbol) {
 async function fetchFearAndGreedData() {
   const todayUtc = new Date().toISOString().split('T')[0];
   
-  // Only call the external API if the date changed or we don't have cache yet
   if (lastFngFetchDate === todayUtc && cachedFngData) {
+    logApiCall('Fear & Greed Cache', FEAR_GREED_URL, `cache hit for ${todayUtc}`);
     return cachedFngData;
   }
 
+  logApiCall('Fear & Greed API', FEAR_GREED_URL, 'start');
   try {
     const response = await axios.get(FEAR_GREED_URL, { timeout: 5000 });
     const currentData = response?.data?.data?.[0];
@@ -300,11 +336,14 @@ async function fetchFearAndGreedData() {
         timestamp: currentData.timestamp 
       };
       lastFngFetchDate = todayUtc;
+      logApiCall('Fear & Greed API', FEAR_GREED_URL, `success, value=${cachedFngData.value}`);
       return cachedFngData;
     }
+    logApiCall('Fear & Greed API', FEAR_GREED_URL, 'success, no current data');
     return cachedFngData; // Fallback to cache if API errors out
   } catch (error) {
     console.error('❌ Fear & Greed API Error:', error.message);
+    logApiCall('Fear & Greed API', FEAR_GREED_URL, `failed: ${error.message}`);
     return cachedFngData; 
   }
 }
@@ -354,11 +393,14 @@ function calculateIntervalChanges(history, currentPrice) {
  * Enhanced spot fetcher gathering high/low spreads alongside price changes
  */
 async function fetchSpotTickerData(symbol) {
+  const url = `${BINANCE_24HR_TICKER_URL}?symbol=${symbol}`;
+  logApiCall('Binance Spot Ticker', url, `start, symbol=${symbol}`);
   try {
-    const response = await axios.get(`${BINANCE_24HR_TICKER_URL}?symbol=${symbol}`, { timeout: 5000 });
+    const response = await axios.get(url, { timeout: 5000 });
     if (response?.data) {
       const currentPrice = parseFloat(response.data.lastPrice);
       const now = Date.now();
+
 
       if (!priceHistoryLog.has(symbol)) {
         priceHistoryLog.set(symbol, []);
@@ -882,8 +924,11 @@ async function sendDiscordNotification(messageText) {
       headers: { 'Content-Type': 'application/json' }
     });
     
+    logApiCall('Discord Webhook', DISCORD_WEBHOOK_URL, `delivered, status=${resp.status}, chars=${safeText.length}`);
     console.log(`[${new Date().toISOString()}] sendDiscordNotification -> delivered, status: ${resp.status}`);
   } catch (error) {
+    const errorSummary = error.response ? JSON.stringify(error.response.data) : error.message;
+    logApiCall('Discord Webhook', DISCORD_WEBHOOK_URL, `failed: ${errorSummary}`);
     // Đoạn này giúp bạn nhìn rõ Discord đang mắng bạn vì lỗi gì (ví dụ: chi tiết lỗi trong error.response.data)
     if (error.response) {
       console.error('❌ Discord API Error Details:', JSON.stringify(error.response.data));
