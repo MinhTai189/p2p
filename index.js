@@ -62,6 +62,18 @@ let cachedFngData = null;
 const priceHistoryLog = new Map();
 
 /**
+ * Helper to determine if current time falls within VN quiet hours (23:00 to 06:00 GMT+7)
+ */
+function isVnQuietHours() {
+  const vnTimeString = new Date().toLocaleString("en-US", { timeZone: "Asia/Ho_Chi_Minh" });
+  const vnHour = new Date(vnTimeString).getHours();
+
+  // Returns true if the hour is 23 (11 PM) up to and including 5 (5:59 AM)
+  return vnHour >= 23 || vnHour < 6;
+}
+
+
+/**
  * Robust fetcher wrapper with Exponential Backoff
  */
 async function fetchWithRetry(url, data, headers, retries = 3, delay = 2000) {
@@ -488,7 +500,9 @@ async function monitorThreshold() {
 
       if (fngValue < 25 && !fngAlertTracker.has(fngDailyKey)) {
         fngAlertTracker.add(fngDailyKey);
-        
+
+        // GATED: Only broadcast to Discord if outside quiet VN hour bands
+        if (!isVnQuietHours()) {
         const avgSellPrice = await calculateHighestSellPrice();
         const sellPriceText = avgSellPrice 
           ? `**${avgSellPrice.toLocaleString('en-US', { maximumFractionDigits: 2 })} VND** (Avg of top 5)` 
@@ -504,7 +518,7 @@ async function monitorThreshold() {
         ].join('\n');
 
         await sendDiscordNotification(fngWarningMessage);
-      }
+      }}
     }
 
     // Refresh spot ticker history for configured tracking symbols
@@ -585,6 +599,12 @@ async function monitorThreshold() {
     const adList = await fetchP2POrderBook("BUY");
     if (!adList || adList.length === 0) return;
 
+    // GATED: Exit the function before iterating over individual target matches during quiet hours
+    if (isVnQuietHours()) {
+      purgeOldCacheTrackingRecords();
+      return;
+    }
+
     const filteredAds = adList.filter(entry => {
       const minTrans = Number(entry.adv.minSingleTransAmount);
       const maxTrans = Number(entry.adv.maxSingleTransAmount);
@@ -647,6 +667,12 @@ async function monitorThreshold() {
  * Summary Displayer
  */
 async function sendInstantSummary() {
+// GATED: Instantly drops scheduled intervals if executed between 23:00 and 06:00
+  if (isVnQuietHours()) {
+    console.log(`[${new Date().toLocaleTimeString()}] Summary omitted. VN night lock active.`);
+    return;
+  }
+  
   console.log(`[${new Date().toISOString()}] sendInstantSummary() start`);
   try {
     const fngData = await fetchFearAndGreedData();
@@ -787,14 +813,41 @@ async function sendDiscordNotification(messageText) {
     console.log(`[${new Date().toISOString()}] sendDiscordNotification skipped: DISCORD_WEBHOOK_URL not set`);
     return;
   }
+
+  // Sửa lỗi 2: Kiểm tra tin nhắn rỗng
+  if (!messageText || String(messageText).trim() === "") {
+    console.error(`[${new Date().toISOString()}] sendDiscordNotification error: messageText is empty`);
+    return;
+  }
+
   try {
-    const ts = new Date().toISOString();
-    const payload = { content: `[${ts}]\n${messageText}` };
-    console.log(`[${ts}] sendDiscordNotification -> dispatching (trunc): ${String(messageText).slice(0,120).replace(/\n/g,' ')}...`);
-    const resp = await axios.post(DISCORD_WEBHOOK_URL, payload, { timeout: 5000 });
+    const ts = new Date().toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
+    
+    // Sửa lỗi 1: Giới hạn ký tự an toàn dưới 2000
+    const maxChars = 1900; 
+    let safeText = String(messageText);
+    if (safeText.length > maxChars) {
+      safeText = safeText.slice(0, maxChars) + "\n...(Tin nhắn quá dài đã bị cắt bớt)...";
+    }
+
+    const payload = { content: `[${ts}]\n${safeText}` };
+    
+    console.log(`[${ts}] sendDiscordNotification -> dispatching (trunc): ${safeText.slice(0,120).replace(/\n/g,' ')}...`);
+    
+    // Sửa lỗi 3: Thêm Headers tường minh
+    const resp = await axios.post(DISCORD_WEBHOOK_URL, payload, { 
+      timeout: 5000,
+      headers: { 'Content-Type': 'application/json' }
+    });
+    
     console.log(`[${new Date().toISOString()}] sendDiscordNotification -> delivered, status: ${resp.status}`);
   } catch (error) {
-    console.error('❌ Discord Delivery Failure:', error.message);
+    // Đoạn này giúp bạn nhìn rõ Discord đang mắng bạn vì lỗi gì (ví dụ: chi tiết lỗi trong error.response.data)
+    if (error.response) {
+      console.error('❌ Discord API Error Details:', JSON.stringify(error.response.data));
+    } else {
+      console.error('❌ Discord Delivery Failure:', error.message);
+    }
   }
 }
 
