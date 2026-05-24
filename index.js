@@ -25,6 +25,9 @@ const FEAR_GREED_URL = 'https://api.alternative.me/fng/';
 const BINANCE_24HR_TICKER_URL = 'https://api.binance.com/api/v3/ticker/24hr';
 const BINANCE_STABLECOIN_PARITY_URL = 'https://api.binance.com/api/v3/ticker/price?symbol=USDCUSDT';
 const BINANCE_LONG_SHORT_RATIO_URL_BASE = 'https://fapi.binance.com/futures/data/topLongShortAccountRatio';
+const BINANCE_TAKER_LONG_SHORT_RATIO_URL = 'https://fapi.binance.com/futures/data/takerlongshortRatio';
+const BINANCE_TOP_LONG_SHORT_POSITION_RATIO_URL = 'https://fapi.binance.com/futures/data/topLongShortPositionRatio';
+const BINANCE_GLOBAL_LONG_SHORT_ACCOUNT_RATIO_URL = 'https://fapi.binance.com/futures/data/globalLongShortAccountRatio';
 const BINANCE_PREMIUM_INDEX_URL = 'https://fapi.binance.com/fapi/v1/premiumIndex';
 const BINANCE_KLINES_URL = 'https://api.binance.com/api/v3/klines';
 const LIVE_EXCHANGE_RATE_URL = 'https://open.er-api.com/v6/latest/USD';
@@ -163,8 +166,8 @@ async function fetchStablecoinParity() {
 }
 
 async function fetchLongShortRatio(symbol = 'BTCUSDT') {
-  const url = `${BINANCE_LONG_SHORT_RATIO_URL_BASE}?symbol=${symbol}&period=5m&limit=1`;
-  logApiCall('Binance Long/Short Ratio', url, 'start');
+  const url = `${BINANCE_LONG_SHORT_RATIO_URL_BASE}?symbol=${symbol}&period=12h&limit=1`;
+  logApiCall('Binance Long/Short Ratio', url, `start (${symbol} 12h)`);
   try {
     const response = await axios.get(url, { timeout: 5000 });
     const ratio = parseFloat(response.data?.[0]?.longShortRatio);
@@ -174,6 +177,69 @@ async function fetchLongShortRatio(symbol = 'BTCUSDT') {
   } catch (error) {
     console.error('❌ Long/Short Ratio Fetch Error:', error.message);
     logApiCall('Binance Long/Short Ratio', url, `failed: ${error.message}`);
+    return null;
+  }
+}
+
+async function fetchTakerLongShortRatio(symbol = 'BTCUSDT', period = '12h', limit = 1) {
+  const url = BINANCE_TAKER_LONG_SHORT_RATIO_URL;
+  logApiCall('Binance Taker Long/Short Ratio', url, `start (${symbol} ${period})`);
+  try {
+    const response = await axios.get(url, { timeout: 5000, params: { symbol, period, limit } });
+    const data = Array.isArray(response.data) ? response.data[0] : null;
+    if (!data) throw new Error('Invalid response');
+    const result = {
+      buySellRatio: Number(data.buySellRatio),
+      buyVol: Number(data.buyVol),
+      sellVol: Number(data.sellVol)
+    };
+    logApiCall('Binance Taker Long/Short Ratio', url, `success, ratio=${result.buySellRatio}`);
+    return result;
+  } catch (error) {
+    console.error('❌ Taker Long/Short Ratio Fetch Error:', error.message);
+    logApiCall('Binance Taker Long/Short Ratio', url, `failed: ${error.message}`);
+    return null;
+  }
+}
+
+async function fetchTopLongShortPositionRatio(symbol = 'BTCUSDT', period = '12h', limit = 1) {
+  const url = BINANCE_TOP_LONG_SHORT_POSITION_RATIO_URL;
+  logApiCall('Binance Top Long/Short Position Ratio', url, `start (${symbol} ${period})`);
+  try {
+    const response = await axios.get(url, { timeout: 5000, params: { symbol, period, limit } });
+    const data = Array.isArray(response.data) ? response.data[0] : null;
+    if (!data) throw new Error('Invalid response');
+    const result = {
+      longShortRatio: Number(data.longShortRatio),
+      longAccount: Number(data.longAccount),
+      shortAccount: Number(data.shortAccount)
+    };
+    logApiCall('Binance Top Long/Short Position Ratio', url, `success, ratio=${result.longShortRatio}`);
+    return result;
+  } catch (error) {
+    console.error('❌ Top Long/Short Position Ratio Fetch Error:', error.message);
+    logApiCall('Binance Top Long/Short Position Ratio', url, `failed: ${error.message}`);
+    return null;
+  }
+}
+
+async function fetchGlobalLongShortAccountRatio(symbol = 'BTCUSDT', period = '12h', limit = 1) {
+  const url = BINANCE_GLOBAL_LONG_SHORT_ACCOUNT_RATIO_URL;
+  logApiCall('Binance Global Long/Short Account Ratio', url, `start (${symbol} ${period})`);
+  try {
+    const response = await axios.get(url, { timeout: 5000, params: { symbol, period, limit } });
+    const data = Array.isArray(response.data) ? response.data[0] : null;
+    if (!data) throw new Error('Invalid response');
+    const result = {
+      longShortRatio: Number(data.longShortRatio),
+      longAccount: Number(data.longAccount),
+      shortAccount: Number(data.shortAccount)
+    };
+    logApiCall('Binance Global Long/Short Account Ratio', url, `success, ratio=${result.longShortRatio}`);
+    return result;
+  } catch (error) {
+    console.error('❌ Global Long/Short Account Ratio Fetch Error:', error.message);
+    logApiCall('Binance Global Long/Short Account Ratio', url, `failed: ${error.message}`);
     return null;
   }
 }
@@ -770,6 +836,9 @@ async function sendInstantSummary() {
       calculateHighestSellPrice(),
       fetchStablecoinParity(),
       fetchLongShortRatio('BTCUSDT'),
+      fetchTakerLongShortRatio('BTCUSDT'),
+      fetchTopLongShortPositionRatio('BTCUSDT'),
+      fetchGlobalLongShortAccountRatio('BTCUSDT'),
       fetchFundingRate('BTCUSDT'),
       fetchFundingRate('SOLUSDT'),
       fetchLiveExchangeRate()
@@ -780,9 +849,12 @@ async function sendInstantSummary() {
     const avgSellPrice = allResults[TRACKING_SYMBOLS.length];
     const stablecoinParity = allResults[TRACKING_SYMBOLS.length + 1];
     const btcLongShortRatio = allResults[TRACKING_SYMBOLS.length + 2];
-    const btcFundingRate = allResults[TRACKING_SYMBOLS.length + 3];
-    const solFundingRate = allResults[TRACKING_SYMBOLS.length + 4];
-    const liveUsdVndRate = allResults[TRACKING_SYMBOLS.length + 5];
+    const btcTakerRatio = allResults[TRACKING_SYMBOLS.length + 3];
+    const btcTopPositionRatio = allResults[TRACKING_SYMBOLS.length + 4];
+    const btcGlobalAccountRatio = allResults[TRACKING_SYMBOLS.length + 5];
+    const btcFundingRate = allResults[TRACKING_SYMBOLS.length + 6];
+    const solFundingRate = allResults[TRACKING_SYMBOLS.length + 7];
+    const liveUsdVndRate = allResults[TRACKING_SYMBOLS.length + 8];
 
     // Map spot results by symbol for easy access
     const spotMap = {};
@@ -859,6 +931,20 @@ async function sendInstantSummary() {
       return '🟢'; 
     };
 
+    const getLongShortSentiment = (r) => {
+      if (r === null) return '⚪ Neutral/Unknown';
+      if (r > 1.05) return '🟢 Bullish';
+      if (r >= 0.95) return '🟡 Neutral';
+      return '🔴 Bearish';
+    };
+
+    const getTakerSentiment = (r) => {
+      if (r === null) return '⚪ Neutral/Unknown';
+      if (r > 1.02) return '🟢 Taker Buying';
+      if (r >= 0.98) return '🟡 Neutral';
+      return '🔴 Taker Selling';
+    };
+
     const getFundingIcon = (f) => {
       if (f === null) return '⚪';
       const absFundingPercentage = Math.abs(f * 100);
@@ -894,7 +980,16 @@ async function sendInstantSummary() {
       `⚖️ **Real USD/VND Spot:** ${liveUsdVndRate ? liveUsdVndRate.toLocaleString('en-US', { maximumFractionDigits: 2 }) : `${IMPLIED_GLOBAL_USD_VND} (fallback)`} VND`,
       ``,
       `🚨 **DERIVATIVES & GLOBAL RISK LEVERS**`,
-      `📈 **BTC Long/Short Ratio:** ${btcLongShortRatio !== null ? btcLongShortRatio.toFixed(2) : 'Fetch Error'} ${getLSRatioIcon(btcLongShortRatio)}`,
+      `📊 **BTC Taker Buy/Sell Volume (12h):** ${btcTakerRatio ? btcTakerRatio.buySellRatio.toFixed(4) : 'Fetch Error'} ${getTakerSentiment(btcTakerRatio?.buySellRatio)} (Buy ${btcTakerRatio ? btcTakerRatio.buyVol.toLocaleString('en-US', { maximumFractionDigits: 2 }) : 'N/A'}, Sell ${btcTakerRatio ? btcTakerRatio.sellVol.toLocaleString('en-US', { maximumFractionDigits: 2 }) : 'N/A'})`,
+      `🐋 **BTC Whale Account L/S (12h):** ${btcLongShortRatio !== null ? btcLongShortRatio.toFixed(2) : 'Fetch Error'} ${getLongShortSentiment(btcLongShortRatio)} ${getLSRatioIcon(btcLongShortRatio)}`,
+      `🐋 **BTC Whale Position L/S (12h):** ${btcTopPositionRatio && btcTopPositionRatio.longShortRatio ? btcTopPositionRatio.longShortRatio.toFixed(2) : 'Fetch Error'} ${getLongShortSentiment(btcTopPositionRatio?.longShortRatio)} ${getLSRatioIcon(btcTopPositionRatio?.longShortRatio || null)} (${btcTopPositionRatio ? `Long ${btcTopPositionRatio.longAccount.toFixed(4)} / Short ${btcTopPositionRatio.shortAccount.toFixed(4)}` : 'N/A'})`,
+      `🧠 **BTC Smart Money Account L/S (12h):** ${btcGlobalAccountRatio && btcGlobalAccountRatio.longShortRatio ? btcGlobalAccountRatio.longShortRatio.toFixed(2) : 'Fetch Error'} ${getLongShortSentiment(btcGlobalAccountRatio?.longShortRatio)} ${getLSRatioIcon(btcGlobalAccountRatio?.longShortRatio || null)} (${btcGlobalAccountRatio ? `Long ${btcGlobalAccountRatio.longAccount.toFixed(4)} / Short ${btcGlobalAccountRatio.shortAccount.toFixed(4)}` : 'N/A'})`,
+      ``,
+      `🏷️ **BTC Sentiment Breakdown (12h)**`,
+      `> Retail / Taker: ${getTakerSentiment(btcTakerRatio?.buySellRatio)}`,
+      `> Whale Account: ${getLongShortSentiment(btcLongShortRatio)}`,
+      `> Whale Position: ${getLongShortSentiment(btcTopPositionRatio?.longShortRatio)}`,
+      `> Smart Money: ${getLongShortSentiment(btcGlobalAccountRatio?.longShortRatio)}`,
       `🔥 **BTC Funding Rate:** ${btcFundingRate !== null ? (btcFundingRate * 100).toFixed(3) + '%' : 'Fetch Error'} ${getFundingIcon(btcFundingRate)}`,
       `🔥 **SOL Funding Rate:** ${solFundingRate !== null ? (solFundingRate * 100).toFixed(3) + '%' : 'Fetch Error'} ${getFundingIcon(solFundingRate)}`,
       `🔗 **USDC/USDT Parity:** ${stablecoinParity ? stablecoinParity.toFixed(4) : 'Fetch Error'} ${getParityIcon(stablecoinParity)}`,
