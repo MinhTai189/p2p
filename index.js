@@ -15,8 +15,8 @@ const TRACKING_INTERVAL_MIN = Number(process.env.TRACKING_INTERVAL_MIN) || 5;
 const TRACKING_WINDOW_MIN = Number(process.env.TRACKING_WINDOW_MIN) || 30;   
 
 // CRITICAL FIX: Changed back to your strict 1-minute execution interval
-const MONITOR_INTERVAL_MS = Number(process.env.MONITOR_INTERVAL_MIN) * 60 * 1000;       
-const SUMMARY_INTERVAL_MS = (Number(process.env.SUMMARY_INTERVAL_MIN) || 10) * 60 * 1000;  
+const MONITOR_INTERVAL_MS = (Number(process.env.MONITOR_INTERVAL_MIN) || 1) * 60 * 1000;
+const SUMMARY_INTERVAL_MS = (Number(process.env.SUMMARY_INTERVAL_MIN) || 10) * 60 * 1000;
 const MAX_HISTORY_WINDOW_MS = TRACKING_WINDOW_MIN * 60 * 1000; 
 
 const BINANCE_P2P_URL = 'https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search';
@@ -26,6 +26,7 @@ const BINANCE_STABLECOIN_PARITY_URL = 'https://api.binance.com/api/v3/ticker/pri
 const BINANCE_LONG_SHORT_RATIO_URL_BASE = 'https://fapi.binance.com/futures/data/topLongShortAccountRatio';
 const BINANCE_PREMIUM_INDEX_URL = 'https://fapi.binance.com/fapi/v1/premiumIndex';
 const BINANCE_KLINES_URL = 'https://api.binance.com/api/v3/klines';
+const LIVE_EXCHANGE_RATE_URL = 'https://open.er-api.com/v6/latest/USD';
 const IMPLIED_GLOBAL_USD_VND = Number(process.env.IMPLIED_GLOBAL_USD_VND) || 25420;
 const STABLECOIN_DEPEG_THRESHOLD = Number(process.env.STABLECOIN_DEPEG_THRESHOLD) || 0.002;
 const FUNDING_RATE_WARNING_THRESHOLD = Number(process.env.FUNDING_RATE_WARNING_THRESHOLD) || 0.0005;
@@ -151,6 +152,17 @@ async function fetchFundingRate(symbol = 'BTCUSDT') {
     return Number.isFinite(lastFundingRate) ? lastFundingRate : null;
   } catch (error) {
     console.error(`❌ Funding Rate Fetch Error (${symbol}):`, error.message);
+    return null;
+  }
+}
+
+async function fetchLiveExchangeRate() {
+  try {
+    const response = await axios.get(LIVE_EXCHANGE_RATE_URL, { timeout: 5000 });
+    const vndRate = parseFloat(response.data?.rates?.VND);
+    return Number.isFinite(vndRate) ? vndRate : null;
+  } catch (error) {
+    console.error('❌ Live Exchange Rate Fetch Error:', error.message);
     return null;
   }
 }
@@ -648,7 +660,8 @@ async function sendInstantSummary() {
       fetchStablecoinParity(),
       fetchLongShortRatio('BTCUSDT'),
       fetchFundingRate('BTCUSDT'),
-      fetchFundingRate('SOLUSDT')
+      fetchFundingRate('SOLUSDT'),
+      fetchLiveExchangeRate()
     ];
     const allResults = await Promise.all([...spotPromises, ...extraPromises]);
     const spotResults = allResults.slice(0, TRACKING_SYMBOLS.length);
@@ -657,6 +670,7 @@ async function sendInstantSummary() {
     const btcLongShortRatio = allResults[TRACKING_SYMBOLS.length + 2];
     const btcFundingRate = allResults[TRACKING_SYMBOLS.length + 3];
     const solFundingRate = allResults[TRACKING_SYMBOLS.length + 4];
+    const liveUsdVndRate = allResults[TRACKING_SYMBOLS.length + 5];
 
     // Map spot results by symbol for easy access
     const spotMap = {};
@@ -705,40 +719,64 @@ async function sendInstantSummary() {
       : 'Data Unavailable';
 
     const fngValue = fngData ? fngData.value : 50; 
-    const p2pPriceRaw = marketData ? marketData.price : null;
+    const p2pPriceRaw = marketData ? Number(marketData.price) : null;
+    const effectiveRate = liveUsdVndRate || IMPLIED_GLOBAL_USD_VND;
+    const livePremium = p2pPriceRaw ? (((p2pPriceRaw / effectiveRate) - 1) * 100) : null;
+    const premiumLabel = livePremium !== null && Math.abs(livePremium) < 1.5 ? '(Normal Liquidity Band)' : livePremium !== null && livePremium > 2.5 ? '(⚠️ Capital Flight)' : livePremium !== null && livePremium < -0.5 ? '(💎 Discount Entry)' : '';
     const advice = runDynamicQuantEngine(fngValue, p2pPriceRaw, btc, eth, bnb, sol, stablecoinParity, btcLongShortRatio, btcFundingRate, solFundingRate);
 
-    const summaryMessage = [
-      `📊 **DYNAMIC QUANT REPORT**`,
+    // ==========================================
+    // MESSAGE 1: CORE MARKET STATISTICS (Ordered by Importance)
+    // ==========================================
+    const statisticMessage = [
+      `📊 **DYNAMIC QUANT REPORT: MARKET METRICS**`,
       `==============================`,
+      `⚙️ **LOCAL P2P LIQUIDITY ENGINE**`,
       `📉 **Instant Lowest P2P Buy:** ${p2pBuyText}`,
       `📈 **Highest P2P Sell (Cash-Out):** ${sellPriceText}`,
-      `🔗 **USDC/USDT Parity:** ${stablecoinParity ? stablecoinParity.toFixed(4) : 'Fetch Error'}`,
+      `💎 **P2P Premium Rate:** ${livePremium !== null ? (livePremium >= 0 ? '+' : '') + livePremium.toFixed(2) + '%' : 'Unavailable'} ${premiumLabel}`,
+      `⚖️ **Real USD/VND Spot:** ${liveUsdVndRate ? liveUsdVndRate.toLocaleString('en-US', { maximumFractionDigits: 2 }) : `${IMPLIED_GLOBAL_USD_VND} (fallback)`} VND`,
+      ``,
+      `🚨 **DERIVATIVES & GLOBAL RISK LEVERS**`,
       `📈 **BTC Long/Short Ratio:** ${btcLongShortRatio !== null ? btcLongShortRatio.toFixed(2) : 'Fetch Error'}`,
       `🔥 **BTC Funding Rate:** ${btcFundingRate !== null ? (btcFundingRate * 100).toFixed(3) + '%' : 'Fetch Error'}`,
       `🔥 **SOL Funding Rate:** ${solFundingRate !== null ? (solFundingRate * 100).toFixed(3) + '%' : 'Fetch Error'}`,
+      `🔗 **USDC/USDT Parity:** ${stablecoinParity ? stablecoinParity.toFixed(4) : 'Fetch Error'}`,
+      ``,
+      `🎭 **MACRO SENTIMENT & TARGETS**`,
       `🎭 **Crypto Fear & Greed:** ${fngIndexText}`,
       `🎯 **Active Alert Target:** Under ${TARGET_PRICE} VND`,
       `==============================`,
-      `🪙 **Global Spot Market Indexes & History Matrix:**`,
+      `🪙 **GLOBAL SPOT MARKET INDEXES & VELOCITY**`,
       ...displays.flatMap(({ symbol, display }) => ([
         `> ${display.indicator} **${symbol.replace('USDT','')}**: ${display.text}`,
         `> ⏱️ ${display.intervals}`,
         `>`
-      ])),
+      ])).slice(0, -1) // Drops the final trailing empty layout point
+    ].join('\n');
+
+    // ==========================================
+    // MESSAGE 2: INTERPRETATION & ACTIONABLE STRATEGY
+    // ==========================================
+    const strategyMessage = [
+      `🧠 **DYNAMIC QUANT REPORT: ALGORITHMIC STRATEGY**`,
       `==============================`,
-      `🧠 **MATHEMATICAL ROTATION METRICS:**`,
-      `> 📋 **Macro Phase Context:** *${advice.context}*`,
-      `> 🧭 **Strategy Guidance:**`,
+      `📋 **Macro Phase Context:** *${advice.context}*`,
+      ``,
+      `🧭 **Strategy Guidance:**`,
       `${advice.recommendations}`,
       ``,
+      `🎯 **Tactical Execution Directives:**`,
       `${advice.bullets}`,
       `==============================`,
       `⚙️ *Bot Status: Operational*`
     ].join('\n');
 
-    await sendDiscordNotification(summaryMessage);
-    console.log(`[${new Date().toISOString()}] sendInstantSummary() dispatched summary`);
+    // Fire events sequentially to prevent Discord content interleaving issues
+    await sendDiscordNotification(statisticMessage);
+    await sendDiscordNotification(strategyMessage);
+    
+    console.log(`[${new Date().toISOString()}] sendInstantSummary() split payload successfully dispatched.`);
   } catch (error) {
     console.error('❌ Failed to compile dynamic summary snapshot:', error.message);
   }
