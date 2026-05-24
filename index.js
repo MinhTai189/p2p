@@ -751,7 +751,7 @@ async function monitorThreshold() {
  * Summary Displayer
  */
 async function sendInstantSummary() {
-// GATED: Instantly drops scheduled intervals if executed between 23:00 and 06:00
+  // GATED: Instantly drops scheduled intervals if executed between 23:00 and 06:00
   if (isVnQuietHours()) {
     console.log(`[${new Date().toLocaleTimeString()}] Summary omitted. VN night lock active.`);
     return;
@@ -773,6 +773,7 @@ async function sendInstantSummary() {
       fetchFundingRate('SOLUSDT'),
       fetchLiveExchangeRate()
     ];
+    
     const allResults = await Promise.all([...spotPromises, ...extraPromises]);
     const spotResults = allResults.slice(0, TRACKING_SYMBOLS.length);
     const avgSellPrice = allResults[TRACKING_SYMBOLS.length];
@@ -833,7 +834,51 @@ async function sendInstantSummary() {
     const effectiveRate = liveUsdVndRate || IMPLIED_GLOBAL_USD_VND;
     const livePremium = p2pPriceRaw ? (((p2pPriceRaw / effectiveRate) - 1) * 100) : null;
     const premiumLabel = livePremium !== null && Math.abs(livePremium) < 1.5 ? '(Normal Liquidity Band)' : livePremium !== null && livePremium > 2.5 ? '(⚠️ Capital Flight)' : livePremium !== null && livePremium < -0.5 ? '(💎 Discount Entry)' : '';
+    
     const advice = runDynamicQuantEngine(fngValue, p2pPriceRaw, btc, eth, bnb, sol, stablecoinParity, btcLongShortRatio, btcFundingRate, solFundingRate);
+
+    // ==========================================
+    // METRIC RISK-LEVEL ICON MAP HELPERS
+    // 🔴 = High Danger/Anomalous Heat
+    // 🟡 = Medium/Transition Alert
+    // 🟢 = Low Risk/Calm Baseline
+    // ==========================================
+    const getPremiumIcon = (p) => {
+      if (p === null) return '⚪';
+      const absP = Math.abs(p);
+      if (absP > 2.0) return '🔴';
+      if (absP >= 0.5) return '🟡';
+      return '🟢';
+    };
+
+    const getLSRatioIcon = (r) => {
+      if (r === null) return '⚪';
+      if (r > 1.8 || r < 0.8) return '🔴'; 
+      if (r >= 1.4 || r <= 1.0) return '🟡';
+      return '🟢'; 
+    };
+
+    const getFundingIcon = (f) => {
+      if (f === null) return '⚪';
+      const absFundingPercentage = Math.abs(f * 100);
+      if (absFundingPercentage > 0.04) return '🔴'; 
+      if (absFundingPercentage >= 0.01) return '🟡';
+      return '🟢'; 
+    };
+
+    const getParityIcon = (p) => {
+      if (!p) return '⚪';
+      const deviation = Math.abs(p - 1.0);
+      if (deviation > 0.008) return '🔴'; 
+      if (deviation >= 0.002) return '🟡';
+      return '🟢'; 
+    };
+
+    const getFngIcon = (v) => {
+      if (v > 75 || v < 25) return '🔴'; 
+      if (v >= 60 || v <= 40) return '🟡';
+      return '🟢';
+    };
 
     // ==========================================
     // MESSAGE 1: CORE MARKET STATISTICS (Ordered by Importance)
@@ -844,17 +889,17 @@ async function sendInstantSummary() {
       `⚙️ **LOCAL P2P LIQUIDITY ENGINE**`,
       `📉 **Instant Lowest P2P Buy:** ${p2pBuyText}`,
       `📈 **Highest P2P Sell (Cash-Out):** ${sellPriceText}`,
-      `💎 **P2P Premium Rate:** ${livePremium !== null ? (livePremium >= 0 ? '+' : '') + livePremium.toFixed(2) + '%' : 'Unavailable'} ${premiumLabel}`,
+      `💎 **P2P Premium Rate:** ${livePremium !== null ? (livePremium >= 0 ? '+' : '') + livePremium.toFixed(2) + '%' : 'Unavailable'} ${premiumLabel} ${getPremiumIcon(livePremium)}`,
       `⚖️ **Real USD/VND Spot:** ${liveUsdVndRate ? liveUsdVndRate.toLocaleString('en-US', { maximumFractionDigits: 2 }) : `${IMPLIED_GLOBAL_USD_VND} (fallback)`} VND`,
       ``,
       `🚨 **DERIVATIVES & GLOBAL RISK LEVERS**`,
-      `📈 **BTC Long/Short Ratio:** ${btcLongShortRatio !== null ? btcLongShortRatio.toFixed(2) : 'Fetch Error'}`,
-      `🔥 **BTC Funding Rate:** ${btcFundingRate !== null ? (btcFundingRate * 100).toFixed(3) + '%' : 'Fetch Error'}`,
-      `🔥 **SOL Funding Rate:** ${solFundingRate !== null ? (solFundingRate * 100).toFixed(3) + '%' : 'Fetch Error'}`,
-      `🔗 **USDC/USDT Parity:** ${stablecoinParity ? stablecoinParity.toFixed(4) : 'Fetch Error'}`,
+      `📈 **BTC Long/Short Ratio:** ${btcLongShortRatio !== null ? btcLongShortRatio.toFixed(2) : 'Fetch Error'} ${getLSRatioIcon(btcLongShortRatio)}`,
+      `🔥 **BTC Funding Rate:** ${btcFundingRate !== null ? (btcFundingRate * 100).toFixed(3) + '%' : 'Fetch Error'} ${getFundingIcon(btcFundingRate)}`,
+      `🔥 **SOL Funding Rate:** ${solFundingRate !== null ? (solFundingRate * 100).toFixed(3) + '%' : 'Fetch Error'} ${getFundingIcon(solFundingRate)}`,
+      `🔗 **USDC/USDT Parity:** ${stablecoinParity ? stablecoinParity.toFixed(4) : 'Fetch Error'} ${getParityIcon(stablecoinParity)}`,
       ``,
       `🎭 **MACRO SENTIMENT & TARGETS**`,
-      `🎭 **Crypto Fear & Greed:** ${fngIndexText}`,
+      `🎭 **Crypto Fear & Greed:** ${fngIndexText} ${getFngIcon(fngValue)}`,
       `🎯 **Active Alert Target:** Under ${TARGET_PRICE} VND`,
       `==============================`,
       `🪙 **GLOBAL SPOT MARKET INDEXES & VELOCITY**`,
