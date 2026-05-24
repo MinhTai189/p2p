@@ -432,7 +432,7 @@ async function fetchSpotTickerData(symbol) {
  * DYNAMIC QUANT ENGINE
  * Generates programmatic strategies using asset velocity spreads & market premium ratios
  */
-function runDynamicQuantEngine(fngValue, currentP2PPrice, btc, eth, bnb, sol, stablecoinParity, btcLongShortRatio, btcFundingRate, solFundingRate) {
+function runDynamicQuantEngine(fngValue, currentP2PPrice, btc, eth, bnb, sol, stablecoinParity, btcLongShortRatio, btcFundingRate, solFundingRate, liveExchangeRate) {
   const actions = [];
   const strategyNotes = [];
   let marketContext = "Stable Consolidation";
@@ -475,7 +475,8 @@ function runDynamicQuantEngine(fngValue, currentP2PPrice, btc, eth, bnb, sol, st
   }
 
   if (currentP2PPrice) {
-    const premiumRatio = ((currentP2PPrice / IMPLIED_GLOBAL_USD_VND) - 1) * 100;
+    const effectiveExchangeRate = liveExchangeRate || IMPLIED_GLOBAL_USD_VND;
+    const premiumRatio = ((currentP2PPrice / effectiveExchangeRate) - 1) * 100;
     
     if (premiumRatio > 2.5) {
       if (stablecoinStress) {
@@ -835,7 +836,7 @@ async function sendInstantSummary() {
     const livePremium = p2pPriceRaw ? (((p2pPriceRaw / effectiveRate) - 1) * 100) : null;
     const premiumLabel = livePremium !== null && Math.abs(livePremium) < 1.5 ? '(Normal Liquidity Band)' : livePremium !== null && livePremium > 2.5 ? '(⚠️ Capital Flight)' : livePremium !== null && livePremium < -0.5 ? '(💎 Discount Entry)' : '';
     
-    const advice = runDynamicQuantEngine(fngValue, p2pPriceRaw, btc, eth, bnb, sol, stablecoinParity, btcLongShortRatio, btcFundingRate, solFundingRate);
+    const advice = runDynamicQuantEngine(fngValue, p2pPriceRaw, btc, eth, bnb, sol, stablecoinParity, btcLongShortRatio, btcFundingRate, solFundingRate, liveUsdVndRate);
 
     // ==========================================
     // METRIC RISK-LEVEL ICON MAP HELPERS
