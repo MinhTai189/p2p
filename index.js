@@ -926,11 +926,12 @@ async function monitorThreshold() {
 
     const okxPrice = okxP2PData?.topAd?.price ?? null;
     const okxMerchant = okxP2PData?.topAd?.merchant || 'Unknown';
+    const okxMaxTrans = Number(okxP2PData?.topAd?.max ?? 0);
     const okxAlertKey = okxP2PData?.topAd?.id ? `okx:${okxP2PData.topAd.id}` : null;
 
     if (Number.isFinite(okxPrice)) {
-      console.log(`[${new Date().toLocaleTimeString()}] Audit -> OKX P2P Lowest Buy: ${okxPrice} VND | Merchant: ${okxMerchant} | Source: ${okxP2PData.source || 'Unknown'}`);
-      if (okxPrice <= TARGET_PRICE && !isVnQuietHours()) {
+      console.log(`[${new Date().toLocaleTimeString()}] Audit -> OKX P2P Lowest Buy: ${okxPrice} VND | Merchant: ${okxMerchant} | MaxTx: ${okxMaxTrans} | Source: ${okxP2PData.source || 'Unknown'}`);
+      if (okxPrice <= TARGET_PRICE && !isVnQuietHours() && okxMaxTrans >= MAX_SINGLE_TRANS_AMOUNT) {
         const currentAlertCount = okxAlertKey ? adNotificationTracker.get(okxAlertKey) || 0 : 0;
         if (currentAlertCount < MAX_ALERTS_PER_AD) {
           if (okxAlertKey) adNotificationTracker.set(okxAlertKey, currentAlertCount + 1);
