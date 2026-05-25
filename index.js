@@ -31,6 +31,11 @@ const BINANCE_GLOBAL_LONG_SHORT_ACCOUNT_RATIO_URL = 'https://fapi.binance.com/fu
 const BINANCE_PREMIUM_INDEX_URL = 'https://fapi.binance.com/fapi/v1/premiumIndex';
 const BINANCE_KLINES_URL = 'https://api.binance.com/api/v3/klines';
 const LIVE_EXCHANGE_RATE_URL = 'https://open.er-api.com/v6/latest/USD';
+const OKX_P2P_BASE_URL = 'https://www.okx.com/v3/c2c';
+const OKX_P2P_BOOKS_URL = `${OKX_P2P_BASE_URL}/tradingOrders/books`;
+const OKX_P2P_MARKETPLACE_URL = `${OKX_P2P_BASE_URL}/tradingOrders/getMarketplaceAdsPrelogin`;
+const BLACK_MARKET_USD_VND_URL = process.env.BLACK_MARKET_USD_VND_URL || 'https://egcurrency.com/en/currency/USD-to-VND/blackMarket';
+const BLACK_MARKET_USD_VND_LABEL = process.env.BLACK_MARKET_USD_VND_LABEL || 'Black Market USD/VND';
 const IMPLIED_GLOBAL_USD_VND = Number(process.env.IMPLIED_GLOBAL_USD_VND) || 25420;
 const STABLECOIN_DEPEG_THRESHOLD = Number(process.env.STABLECOIN_DEPEG_THRESHOLD) || 0.002;
 const FUNDING_RATE_WARNING_THRESHOLD = Number(process.env.FUNDING_RATE_WARNING_THRESHOLD) || 0.0005;
@@ -148,6 +153,173 @@ async function calculateHighestSellPrice() {
   const totalSum = targetBatch.reduce((sum, entry) => sum + parseFloat(entry.adv.price), 0);
   
   return totalSum / targetBatch.length;
+}
+
+function extractNumericRate(payload, depth = 0) {
+  if (payload == null || depth > 3) return null;
+  if (typeof payload === 'number' && Number.isFinite(payload)) return payload;
+  if (typeof payload === 'string') {
+    const cleaned = payload.replace(/,/g, '').match(/([0-9]+(?:\.[0-9]+)?)/);
+    return cleaned ? parseFloat(cleaned[1]) : null;
+  }
+  if (typeof payload === 'object') {
+    const keys = ['rate', 'price', 'exchangeRate', 'result', 'value', 'vnd', 'usdVnd', 'usd_vnd'];
+    for (const key of keys) {
+      if (Object.prototype.hasOwnProperty.call(payload, key)) {
+        const candidate = extractNumericRate(payload[key], depth + 1);
+        if (Number.isFinite(candidate)) return candidate;
+      }
+    }
+    for (const value of Object.values(payload)) {
+      if (typeof value === 'object') {
+        const nested = extractNumericRate(value, depth + 1);
+        if (Number.isFinite(nested)) return nested;
+      }
+    }
+  }
+  return null;
+}
+
+async function fetchOkxP2PAdsFromMarketplace(tradeType = 'BUY') {
+  const side = tradeType === 'BUY' ? 'sell' : 'buy';
+  const params = new URLSearchParams({
+    paymentMethod: 'all',
+    side,
+    userType: 'all',
+    sortType: tradeType === 'BUY' ? 'price_asc' : 'price_desc',
+    limit: '20',
+    cryptoCurrency: 'USDT',
+    fiatCurrency: 'VND',
+    currentPage: '1',
+    numberPerPage: '20',
+    t: `${Date.now()}`
+  });
+
+  const url = `${OKX_P2P_MARKETPLACE_URL}?${params.toString()}`;
+  logApiCall('OKX P2P Ads Fallback', url, `tradeType=${tradeType} start`);
+
+  try {
+    const response = await axios.get(url, {
+      timeout: 8000,
+      headers: {
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Origin': 'https://www.okx.com',
+        'Referer': 'https://www.okx.com/p2p-markets?currency=USDT&fiat=VND&tradeType=BUY',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+      }
+    });
+
+    const ads = response?.data?.data?.[side];
+    const count = Array.isArray(ads) ? ads.length : 0;
+    logApiCall('OKX P2P Ads Fallback', url, `success, ads=${count}`);
+    return Array.isArray(ads) ? { ads, source: 'Marketplace' } : null;
+  } catch (error) {
+    console.error(`❌ OKX P2P Fallback Error (${tradeType}):`, error.message);
+    logApiCall('OKX P2P Ads Fallback', url, `failed: ${error.message}`);
+    return null;
+  }
+}
+
+async function fetchOkxP2PAds(tradeType = 'BUY') {
+  const side = tradeType === 'BUY' ? 'sell' : 'buy';
+  const params = new URLSearchParams({
+    side,
+    cryptoCurrency: 'usdt',
+    fiatCurrency: 'vnd',
+    userType: 'all',
+    showHeader: 'true',
+    limit: '10',
+    paymentMethod: 'bank',
+    quoteCurrency: 'vnd',
+    baseCurrency: 'usdt',
+    t: `${Date.now()}`
+  });
+
+  const url = `${OKX_P2P_BOOKS_URL}?${params.toString()}`;
+  logApiCall('OKX P2P Ads', url, `tradeType=${tradeType} start`);
+
+  try {
+    const response = await axios.get(url, {
+      timeout: 8000,
+      headers: {
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Origin': 'https://www.okx.com',
+        'Referer': 'https://www.okx.com/p2p-markets/vnd/buy-usdt',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+      }
+    });
+
+    let ads = response?.data?.data?.[side];
+    const count = Array.isArray(ads) ? ads.length : 0;
+    logApiCall('OKX P2P Ads', url, `success, ads=${count}`);
+
+    if (!Array.isArray(ads) || ads.length === 0) {
+      console.warn('⚠️ OKX P2P /books returned no ads, attempting fallback marketplace endpoint');
+      return await fetchOkxP2PAdsFromMarketplace(tradeType);
+    }
+
+    return { ads, source: 'Books' };
+  } catch (error) {
+    console.error(`❌ OKX P2P Fetch Error (${tradeType}):`, error.message);
+    logApiCall('OKX P2P Ads', url, `failed: ${error.message}`);
+    return await fetchOkxP2PAdsFromMarketplace(tradeType);
+  }
+}
+
+async function fetchOkxP2PBuyMarketData() {
+  const result = await fetchOkxP2PAds('BUY');
+  if (!result || !Array.isArray(result.ads) || result.ads.length === 0) return null;
+
+  const topAds = result.ads.slice(0, 5).map(ad => ({
+    id: ad.id || ad.merchantId || `okx-${Date.now()}`,
+    price: Number(ad.price),
+    merchant: ad.nickName || ad.publicUserId || ad.merchantName || 'Unknown',
+    min: Number(ad.quoteMinAmount || ad.quoteMinAmountPerOrder || ad.minSellOrderQuantity || 0),
+    max: Number(ad.quoteMaxAmountPerOrder || ad.quoteMaxAmount || ad.maxSellOrderQuantity || 0),
+    available: Number(ad.availableAmount || ad.availableAmountPerOrder || 0),
+    paymentMethods: Array.isArray(ad.paymentMethods) ? ad.paymentMethods : []
+  }));
+
+  const avgPrice = topAds.reduce((sum, entry) => sum + entry.price, 0) / topAds.length;
+  return { topAd: topAds[0], avgPrice, topAds, source: result.source };
+}
+
+async function fetchBlackMarketExchangeRate() {
+  if (!BLACK_MARKET_USD_VND_URL) return null;
+  logApiCall('Black Market USD/VND Rate', BLACK_MARKET_USD_VND_URL, 'start');
+
+  try {
+    const response = await axios.get(BLACK_MARKET_USD_VND_URL, {
+      timeout: 8000,
+      headers: {
+        'Accept': 'application/json, text/html, */*',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+      }
+    });
+
+    let rate = extractNumericRate(response.data);
+    if (!Number.isFinite(rate) && typeof response.data === 'string') {
+      const htmlBody = response.data;
+      const jsRateMatch = htmlBody.match(/"USD"\s*:\s*\{[^}]*"buy"\s*:\s*([0-9.,]+)/i);
+      if (jsRateMatch) {
+        rate = parseFloat(jsRateMatch[1].replace(/,/g, ''));
+      }
+    }
+
+    if (Number.isFinite(rate) && rate > 0) {
+      logApiCall('Black Market USD/VND Rate', BLACK_MARKET_USD_VND_URL, `success, rate=${rate}`);
+      return rate;
+    }
+
+    logApiCall('Black Market USD/VND Rate', BLACK_MARKET_USD_VND_URL, 'success, rate=invalid');
+    return null;
+  } catch (error) {
+    console.error('❌ Black Market Exchange Rate Fetch Error:', error.message);
+    logApiCall('Black Market USD/VND Rate', BLACK_MARKET_USD_VND_URL, `failed: ${error.message}`);
+    return null;
+  }
 }
 
 async function fetchStablecoinParity() {
@@ -747,8 +919,34 @@ async function monitorThreshold() {
       console.error('❌ Downtrend evaluation loop error:', e.message);
     }
 
-    const adList = await fetchP2POrderBook("BUY");
-    if (!adList || adList.length === 0) return;
+    const [adList, okxP2PData] = await Promise.all([
+      fetchP2POrderBook("BUY"),
+      fetchOkxP2PBuyMarketData()
+    ]);
+
+    const okxPrice = okxP2PData?.topAd?.price ?? null;
+    const okxMerchant = okxP2PData?.topAd?.merchant || 'Unknown';
+    const okxAlertKey = okxP2PData?.topAd?.id ? `okx:${okxP2PData.topAd.id}` : null;
+
+    if (Number.isFinite(okxPrice)) {
+      console.log(`[${new Date().toLocaleTimeString()}] Audit -> OKX P2P Lowest Buy: ${okxPrice} VND | Merchant: ${okxMerchant} | Source: ${okxP2PData.source || 'Unknown'}`);
+      if (okxPrice <= TARGET_PRICE && !isVnQuietHours()) {
+        const currentAlertCount = okxAlertKey ? adNotificationTracker.get(okxAlertKey) || 0 : 0;
+        if (currentAlertCount < MAX_ALERTS_PER_AD) {
+          if (okxAlertKey) adNotificationTracker.set(okxAlertKey, currentAlertCount + 1);
+          const okxAlertMessage = [
+            `⚠️ **OKX P2P TARGET REACHED @everyone**`,
+            `> 💰 **Buy Price:** ${okxPrice} VND`,
+            `> 👤 **Merchant:** ${okxMerchant}`,
+            `> 🟦 **Source:** OKX P2P`,
+            `> 🎯 **Target Set:** Under ${TARGET_PRICE} VND`
+          ].join('\n');
+          await sendDiscordNotification(okxAlertMessage);
+        }
+      }
+    }
+
+    if ((!adList || adList.length === 0) && !Number.isFinite(okxPrice)) return;
 
     // GATED: Exit the function before iterating over individual target matches during quiet hours
     if (isVnQuietHours()) {
@@ -756,7 +954,7 @@ async function monitorThreshold() {
       return;
     }
 
-    const filteredAds = adList.filter(entry => {
+    const filteredAds = (adList || []).filter(entry => {
       const minTrans = Number(entry.adv.minSingleTransAmount);
       const maxTrans = Number(entry.adv.maxSingleTransAmount);
       return maxTrans >= MAX_SINGLE_TRANS_AMOUNT;
@@ -841,7 +1039,9 @@ async function sendInstantSummary() {
       fetchGlobalLongShortAccountRatio('BTCUSDT'),
       fetchFundingRate('BTCUSDT'),
       fetchFundingRate('SOLUSDT'),
-      fetchLiveExchangeRate()
+      fetchLiveExchangeRate(),
+      fetchOkxP2PBuyMarketData(),
+      fetchBlackMarketExchangeRate()
     ];
     
     const allResults = await Promise.all([...spotPromises, ...extraPromises]);
@@ -855,6 +1055,8 @@ async function sendInstantSummary() {
     const btcFundingRate = allResults[TRACKING_SYMBOLS.length + 6];
     const solFundingRate = allResults[TRACKING_SYMBOLS.length + 7];
     const liveUsdVndRate = allResults[TRACKING_SYMBOLS.length + 8];
+    const okxP2PData = allResults[TRACKING_SYMBOLS.length + 9];
+    const blackMarketRate = allResults[TRACKING_SYMBOLS.length + 10];
 
     // Map spot results by symbol for easy access
     const spotMap = {};
@@ -907,6 +1109,17 @@ async function sendInstantSummary() {
     const effectiveRate = liveUsdVndRate || IMPLIED_GLOBAL_USD_VND;
     const livePremium = p2pPriceRaw ? (((p2pPriceRaw / effectiveRate) - 1) * 100) : null;
     const premiumLabel = livePremium !== null && Math.abs(livePremium) < 1.5 ? '(Normal Liquidity Band)' : livePremium !== null && livePremium > 2.5 ? '(⚠️ Capital Flight)' : livePremium !== null && livePremium < -0.5 ? '(💎 Discount Entry)' : '';
+    const okxP2PText = okxP2PData && okxP2PData.topAd
+      ? `**${okxP2PData.topAd.price.toLocaleString('en-US', { maximumFractionDigits: 0 })} VND** (${okxP2PData.topAd.merchant})`
+      : 'Unavailable';
+    const okxAvgText = okxP2PData && okxP2PData.avgPrice
+      ? `**${okxP2PData.avgPrice.toLocaleString('en-US', { maximumFractionDigits: 0 })} VND**`
+      : 'Unavailable';
+    const okxSourceLabel = okxP2PData && okxP2PData.source ? ` [OKX source: ${okxP2PData.source}]` : '';
+    const okxFallbackNotice = okxP2PData?.source === 'Marketplace'
+      ? '⚠️ **OKX fallback active:** Marketplace endpoint used'
+      : '';
+    const blackMarketUsdVnd = blackMarketRate ? blackMarketRate.toLocaleString('en-US', { maximumFractionDigits: 0 }) : null;
     
     const advice = runDynamicQuantEngine(fngValue, p2pPriceRaw, btc, eth, bnb, sol, stablecoinParity, btcLongShortRatio, btcFundingRate, solFundingRate, liveUsdVndRate);
 
@@ -978,6 +1191,10 @@ async function sendInstantSummary() {
       `📈 **Highest P2P Sell (Cash-Out):** ${sellPriceText}`,
       `💎 **P2P Premium Rate:** ${livePremium !== null ? (livePremium >= 0 ? '+' : '') + livePremium.toFixed(2) + '%' : 'Unavailable'} ${premiumLabel} ${getPremiumIcon(livePremium)}`,
       `⚖️ **Real USD/VND Spot:** ${liveUsdVndRate ? liveUsdVndRate.toLocaleString('en-US', { maximumFractionDigits: 2 }) : `${IMPLIED_GLOBAL_USD_VND} (fallback)`} VND`,
+      `💱 **${BLACK_MARKET_USD_VND_LABEL}:** ${blackMarketUsdVnd ? blackMarketUsdVnd + ' VND' : 'Unavailable'}`,
+      `🟦 **OKX P2P Lowest Buy:** ${okxP2PText}${okxSourceLabel}`,
+      `🟦 **OKX P2P Top 5 Avg:** ${okxAvgText}`,
+      ...(okxFallbackNotice ? [okxFallbackNotice] : []),
       ``,
       `🚨 **DERIVATIVES & GLOBAL RISK LEVERS**`,
       `📊 **BTC Taker Buy/Sell Volume (12h):** ${btcTakerRatio ? btcTakerRatio.buySellRatio.toFixed(4) : 'Fetch Error'} ${getTakerSentiment(btcTakerRatio?.buySellRatio)} (Buy ${btcTakerRatio ? btcTakerRatio.buyVol.toLocaleString('en-US', { maximumFractionDigits: 2 }) : 'N/A'}, Sell ${btcTakerRatio ? btcTakerRatio.sellVol.toLocaleString('en-US', { maximumFractionDigits: 2 }) : 'N/A'})`,
