@@ -2,6 +2,7 @@ const axios = require('axios');
 const http = require('http');
 require('dotenv').config();
 const { XMLParser } = require('fast-xml-parser');
+const cheerio = require('cheerio');
 
 const PORT = process.env.PORT || 3000;
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
@@ -12,13 +13,13 @@ const MIN_SINGLE_TRANS_AMOUNT = Number(process.env.MIN_SINGLE_TRANS_AMOUNT) || 0
 const MAX_SINGLE_TRANS_AMOUNT = Number(process.env.MAX_SINGLE_TRANS_AMOUNT) || Infinity;
 
 // Dynamic lookback tracking adjustments linked to your .env configuration
-const TRACKING_INTERVAL_MIN = Number(process.env.TRACKING_INTERVAL_MIN) || 5; 
-const TRACKING_WINDOW_MIN = Number(process.env.TRACKING_WINDOW_MIN) || 30;   
+const TRACKING_INTERVAL_MIN = Number(process.env.TRACKING_INTERVAL_MIN) || 5;
+const TRACKING_WINDOW_MIN = Number(process.env.TRACKING_WINDOW_MIN) || 30;
 
 // CRITICAL FIX: Changed back to your strict 1-minute execution interval
 const MONITOR_INTERVAL_MS = (Number(process.env.MONITOR_INTERVAL_MIN) || 1) * 60 * 1000;
 const SUMMARY_INTERVAL_MS = (Number(process.env.SUMMARY_INTERVAL_MIN) || 10) * 60 * 1000;
-const MAX_HISTORY_WINDOW_MS = TRACKING_WINDOW_MIN * 60 * 1000; 
+const MAX_HISTORY_WINDOW_MS = TRACKING_WINDOW_MIN * 60 * 1000;
 
 const BINANCE_P2P_URL = 'https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search';
 const FEAR_GREED_URL = 'https://api.alternative.me/fng/';
@@ -34,7 +35,7 @@ const LIVE_EXCHANGE_RATE_URL = 'https://open.er-api.com/v6/latest/USD';
 const OKX_P2P_BASE_URL = 'https://www.okx.com/v3/c2c';
 const OKX_P2P_BOOKS_URL = `${OKX_P2P_BASE_URL}/tradingOrders/books`;
 const OKX_P2P_MARKETPLACE_URL = `${OKX_P2P_BASE_URL}/tradingOrders/getMarketplaceAdsPrelogin`;
-const BLACK_MARKET_USD_VND_URL = process.env.BLACK_MARKET_USD_VND_URL || 'https://egcurrency.com/en/currency/USD-to-VND/blackMarket';
+const BLACK_MARKET_USD_VND_URL = process.env.BLACK_MARKET_USD_VND_URL || 'https://chogia.vn/ngoai-te/usd-cho-den';
 const BLACK_MARKET_USD_VND_LABEL = process.env.BLACK_MARKET_USD_VND_LABEL || 'Black Market USD/VND';
 const IMPLIED_GLOBAL_USD_VND = Number(process.env.IMPLIED_GLOBAL_USD_VND) || 25420;
 const STABLECOIN_DEPEG_THRESHOLD = Number(process.env.STABLECOIN_DEPEG_THRESHOLD) || 0.002;
@@ -56,7 +57,7 @@ const DOWNTREND_SYMBOLS = (process.env.DOWNTREND_SYMBOLS || 'BTCUSDT,ETHUSDT,SOL
 
 // Global memory state
 let lastKnownMarketData = null;
-const adNotificationTracker = new Map(); 
+const adNotificationTracker = new Map();
 const MAX_ALERTS_PER_AD = 3;
 
 // Tracker to prevent FnG alert spamming (tracks alerts by date + index value)
@@ -65,6 +66,14 @@ const fngAlertTracker = new Set();
 // Gating state to prevent rate-limiting on the daily-updating FnG API endpoint
 let lastFngFetchDate = '';
 let cachedFngData = null;
+// Initialize the memory cache structure
+const cache = {
+  data: null,
+  expiresAt: 0
+};
+
+// Configurable Cache Duration: 8 hours (8 * 60 * 1000 ms * 60)
+const CACHE_TTL = 8 * 60 * 60 * 1000;
 
 /**
  * Historical Data Cache Map
@@ -151,7 +160,7 @@ async function calculateHighestSellPrice() {
 
   const targetBatch = sellAds.slice(0, 5);
   const totalSum = targetBatch.reduce((sum, entry) => sum + parseFloat(entry.adv.price), 0);
-  
+
   return totalSum / targetBatch.length;
 }
 
@@ -286,39 +295,123 @@ async function fetchOkxP2PBuyMarketData() {
   return { topAd: topAds[0], avgPrice, topAds, source: result.source };
 }
 
-async function fetchBlackMarketExchangeRate() {
-  if (!BLACK_MARKET_USD_VND_URL) return null;
-  logApiCall('Black Market USD/VND Rate', BLACK_MARKET_USD_VND_URL, 'start');
+function parseVndString(text) {
+  if (!text) return 0;
+  const clean = text.replace(/[^0-9]/g, '');
+  return clean ? parseInt(clean, 10) : 0;
+}
 
-  try {
-    const response = await axios.get(BLACK_MARKET_USD_VND_URL, {
-      timeout: 8000,
-      headers: {
-        'Accept': 'application/json, text/html, */*',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+/**
+ * Validated ChoGia Parser
+ */
+async function fetchFromChoGia() {
+  const url = 'https://chogia.vn/ngoai-te/usd-cho-den/';
+  const { data } = await axios.get(url, {
+    headers: { 
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36' 
+    },
+    timeout: 7000
+  });
+
+  const $ = cheerio.load(data);
+  let buy = 0, sell = 0;
+
+  // STRATEGY 1: Extract from the SEO content paragraph text (Highly stable against structural layout changes)
+  const fullText = $('body').text();
+  // Matches expressions like: "mua vào là 26.309 và bán ra là 26.429"
+  const regexMatch = /mua\s+vào\s+là\s+([\d.,]+)\s+và\s+bán\s+ra\s+là\s+([\d.,]+)/i.exec(fullText);
+
+  if (regexMatch && regexMatch[1] && regexMatch[2]) {
+    buy = parseVndString(regexMatch[1]);
+    sell = parseVndString(regexMatch[2]);
+  }
+
+  // STRATEGY 2: Strict structural mapping fallback if the paragraph structure changes
+  if (!buy || !sell) {
+    $('table tr').each((_, el) => {
+      const rowText = $(el).text().toLowerCase();
+      // Safely check if the line contains USD or Dollar specifically within a free-market list
+      if (rowText.includes('usd') && (rowText.includes('đô la') || rowText.includes('chợ đen'))) {
+        const cols = $(el).find('td');
+        if (cols.length >= 3) {
+          // Typically: Col 0: Symbol, Col 1: Name, Col 2: Buy Rate, Col 3: Sell Rate
+          buy = parseVndString(cols.eq(2).text());
+          sell = parseVndString(cols.eq(3).text());
+          if (buy > 0) return false; // Break loop if successfully populated
+        }
       }
     });
+  }
 
-    let rate = extractNumericRate(response.data);
-    if (!Number.isFinite(rate) && typeof response.data === 'string') {
-      const htmlBody = response.data;
-      const jsRateMatch = htmlBody.match(/"USD"\s*:\s*\{[^}]*"buy"\s*:\s*([0-9.,]+)/i);
-      if (jsRateMatch) {
-        rate = parseFloat(jsRateMatch[1].replace(/,/g, ''));
+  // Final Validation Range check
+  if (buy > 23000 && sell > 23000) {
+    return { buy, sell, source: 'ChoGia Content Engine' };
+  }
+  
+  throw new Error('Could not resolve numeric price blocks from current layout');
+}
+
+/**
+ * Fallback Engine: Alternate source (TyGiaUsd / WebGia backup layout)
+ */
+async function fetchFromBackupSource() {
+  const url = 'https://webgia.com/ty-gia/usd/cho-den/';
+  const { data } = await axios.get(url, {
+    headers: { 'User-Agent': 'Mozilla/5.0' },
+    timeout: 6000
+  });
+
+  const $ = cheerio.load(data);
+  let buy = 0, sell = 0;
+
+  // Search inside explicit layout value indicators
+  const buyEl = $('#muavao, .buy-value, [itemprop="price"]').first();
+  const sellEl = $('#banra, .sell-value').first();
+
+  if (buyEl.length && sellEl.length) {
+    buy = parseVndString(buyEl.text());
+    sell = parseVndString(sellEl.text());
+  }
+
+  if (buy > 23000 && sell > 23000) {
+    return { buy, sell, source: 'WebGia Backup Engine' };
+  }
+  throw new Error('Backup engine failed validation layout');
+}
+
+/**
+ * Master Orchestrator
+ */
+async function fetchBlackMarketExchangeRate(forceRefresh = false) {
+  const now = Date.now();
+
+  if (!forceRefresh && cache.data && now < cache.expiresAt) {
+    return { ...cache.data, cached: true };
+  }
+
+  try {
+    const rateData = await fetchFromChoGia();
+    cache.data = rateData;
+    cache.expiresAt = now + CACHE_TTL;
+    console.log(`✅ ChoGia Engine Success: Buy=${rateData.buy}, Sell=${rateData.sell}. Cache updated for 8 hours.`);
+    return { ...cache.data, cached: false };
+  } catch (err) {
+    console.warn(`⚠️ ChoGia engine extraction failed: ${err.message}. Routing to fallback...`);
+    
+    try {
+      const fallbackData = await fetchFromBackupSource();
+      cache.data = fallbackData;
+      cache.expiresAt = now + CACHE_TTL;
+      console.log(`✅ Backup Engine Success: Buy=${fallbackData.buy}, Sell=${fallbackData.sell}. Cache updated for 8 hours.`);
+      return { ...cache.data, cached: false };
+    } catch (fallbackErr) {
+      console.error('❌ Critical: All active extraction scraping attempts failed.');
+      if (cache.data) {
+        console.log('⚠️ Returning stale cache block as emergency proxy.');
+        return { ...cache.data, cached: true, stale: true };
       }
+      return null;
     }
-
-    if (Number.isFinite(rate) && rate > 0) {
-      logApiCall('Black Market USD/VND Rate', BLACK_MARKET_USD_VND_URL, `success, rate=${rate}`);
-      return rate;
-    }
-
-    logApiCall('Black Market USD/VND Rate', BLACK_MARKET_USD_VND_URL, 'success, rate=invalid');
-    return null;
-  } catch (error) {
-    console.error('❌ Black Market Exchange Rate Fetch Error:', error.message);
-    logApiCall('Black Market USD/VND Rate', BLACK_MARKET_USD_VND_URL, `failed: ${error.message}`);
-    return null;
   }
 }
 
@@ -438,8 +531,8 @@ async function fetchLiveExchangeRate() {
   // --- TRY STRATEGY 1: VIETCOMBANK (Most accurate local retail rate) ---
   try {
     console.log(`[${new Date().toISOString()}] Attempting Vietcombank exchange rate fetch...`);
-    
-    const response = await axios.get(VCB_XML_URL, { 
+
+    const response = await axios.get(VCB_XML_URL, {
       timeout: 5000,
       headers: {
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
@@ -454,7 +547,7 @@ async function fetchLiveExchangeRate() {
       const usdData = rates.find(item => item.CurrencyCode === 'USD');
       if (usdData && usdData.Sell) {
         const vcbVndRate = parseFloat(usdData.Sell.replace(/,/g, ''));
-        
+
         if (Number.isFinite(vcbVndRate) && vcbVndRate > 0) {
           logApiCall('Vietcombank XML', VCB_XML_URL, `success, rate=${vcbVndRate}`);
           console.log(`✅ Success: Pulled clean rate from Vietcombank (${vcbVndRate} VND)`);
@@ -471,10 +564,10 @@ async function fetchLiveExchangeRate() {
   // --- TRY STRATEGY 2: LIVE_EXCHANGE_RATE_URL FALLBACK ---
   try {
     console.log(`[${new Date().toISOString()}] Executing fallback to global macro engine...`);
-    
+
     const response = await axios.get(url, { timeout: 5000 });
     const vndRate = parseFloat(response.data?.rates?.VND);
-    
+
     if (Number.isFinite(vndRate)) {
       logApiCall('Open ER Live USD/VND Rate', url, `success, rate=${vndRate}`);
       console.log(`ℹ️ Fallback Success: Using Global API Baseline (${vndRate} VND)`);
@@ -557,7 +650,7 @@ async function evaluateDowntrend(symbol) {
 
 async function fetchFearAndGreedData() {
   const todayUtc = new Date().toISOString().split('T')[0];
-  
+
   if (lastFngFetchDate === todayUtc && cachedFngData) {
     logApiCall('Fear & Greed Cache', FEAR_GREED_URL, `cache hit for ${todayUtc}`);
     return cachedFngData;
@@ -568,10 +661,10 @@ async function fetchFearAndGreedData() {
     const response = await axios.get(FEAR_GREED_URL, { timeout: 5000 });
     const currentData = response?.data?.data?.[0];
     if (currentData) {
-      cachedFngData = { 
-        value: Number(currentData.value), 
+      cachedFngData = {
+        value: Number(currentData.value),
         classification: currentData.value_classification,
-        timestamp: currentData.timestamp 
+        timestamp: currentData.timestamp
       };
       lastFngFetchDate = todayUtc;
       logApiCall('Fear & Greed API', FEAR_GREED_URL, `success, value=${cachedFngData.value}`);
@@ -582,7 +675,7 @@ async function fetchFearAndGreedData() {
   } catch (error) {
     console.error('❌ Fear & Greed API Error:', error.message);
     logApiCall('Fear & Greed API', FEAR_GREED_URL, `failed: ${error.message}`);
-    return cachedFngData; 
+    return cachedFngData;
   }
 }
 
@@ -607,9 +700,9 @@ function calculateIntervalChanges(history, currentPrice) {
 
     for (const record of history) {
       const diff = Math.abs(record.timestamp - targetTimestamp);
-      const tolerance = (TRACKING_INTERVAL_MIN * 60 * 1000) / 2; 
-      
-      if (diff < smallestDiff && diff < tolerance) { 
+      const tolerance = (TRACKING_INTERVAL_MIN * 60 * 1000) / 2;
+
+      if (diff < smallestDiff && diff < tolerance) {
         smallestDiff = diff;
         bestMatch = record;
       }
@@ -715,7 +808,7 @@ function runDynamicQuantEngine(fngValue, currentP2PPrice, btc, eth, bnb, sol, st
   if (currentP2PPrice) {
     const effectiveExchangeRate = liveExchangeRate || IMPLIED_GLOBAL_USD_VND;
     const premiumRatio = ((currentP2PPrice / effectiveExchangeRate) - 1) * 100;
-    
+
     if (premiumRatio > 2.5) {
       if (stablecoinStress) {
         marketContext = "Global Stablecoin-Driven Stress";
@@ -826,22 +919,23 @@ async function monitorThreshold() {
 
         // GATED: Only broadcast to Discord if outside quiet VN hour bands
         if (!isVnQuietHours()) {
-        const avgSellPrice = await calculateHighestSellPrice();
-        const sellPriceText = avgSellPrice 
-          ? `**${avgSellPrice.toLocaleString('en-US', { maximumFractionDigits: 2 })} VND** (Avg of top 5)` 
-          : 'Data Unavailable';
+          const avgSellPrice = await calculateHighestSellPrice();
+          const sellPriceText = avgSellPrice
+            ? `**${avgSellPrice.toLocaleString('en-US', { maximumFractionDigits: 2 })} VND** (Avg of top 5)`
+            : 'Data Unavailable';
 
-        const fngWarningMessage = [
-          `🚨 **CRITICAL MACRO WARNING: EXTREME FEAR** @everyone🚨`,
-          `==============================`,
-          `🎭 **Fear & Greed Index dropped to:** **${fngValue}** (${fngData.classification})`,
-          `💰 **Highest Cash-Out Sell Price:** ${sellPriceText}`,
-          `📉 *Sentiment threshold (< 25) triggered. High historical variance indicates capitulation patterns.*`,
-          `💼 **Strategy Directive:** Look for localized P2P discounts to execute structural fiat-to-crypto value allocations.`
-        ].join('\n');
+          const fngWarningMessage = [
+            `🚨 **CRITICAL MACRO WARNING: EXTREME FEAR** @everyone🚨`,
+            `==============================`,
+            `🎭 **Fear & Greed Index dropped to:** **${fngValue}** (${fngData.classification})`,
+            `💰 **Highest Cash-Out Sell Price:** ${sellPriceText}`,
+            `📉 *Sentiment threshold (< 25) triggered. High historical variance indicates capitulation patterns.*`,
+            `💼 **Strategy Directive:** Look for localized P2P discounts to execute structural fiat-to-crypto value allocations.`
+          ].join('\n');
 
-        await sendDiscordNotification(fngWarningMessage);
-      }}
+          await sendDiscordNotification(fngWarningMessage);
+        }
+      }
     }
 
     // Refresh spot ticker history for configured tracking symbols
@@ -999,9 +1093,9 @@ async function monitorThreshold() {
             `> 📈 **Max Limit:** ${maxSingleTrans} VND`,
             `> 🎯 **Target Set:** Under ${TARGET_PRICE} VND`
           ].join('\n');
-                                 
+
           await sendDiscordNotification(alertMessage);
-          break; 
+          break;
         }
       }
     }
@@ -1022,7 +1116,7 @@ async function sendInstantSummary() {
     console.log(`[${new Date().toLocaleTimeString()}] Summary omitted. VN night lock active.`);
     return;
   }
-  
+
   console.log(`[${new Date().toISOString()}] sendInstantSummary() start`);
   try {
     const fngData = await fetchFearAndGreedData();
@@ -1044,7 +1138,7 @@ async function sendInstantSummary() {
       fetchOkxP2PBuyMarketData(),
       fetchBlackMarketExchangeRate()
     ];
-    
+
     const allResults = await Promise.all([...spotPromises, ...extraPromises]);
     const spotResults = allResults.slice(0, TRACKING_SYMBOLS.length);
     const avgSellPrice = allResults[TRACKING_SYMBOLS.length];
@@ -1072,11 +1166,11 @@ async function sendInstantSummary() {
 
     const formatDisplay = (data, isBtc) => {
       if (!data) return { text: 'Fetch Error', indicator: '❌', intervals: '' };
-      const formattedPrice = isBtc 
-        ? Math.floor(data.rawPrice).toLocaleString('en-US') 
+      const formattedPrice = isBtc
+        ? Math.floor(data.rawPrice).toLocaleString('en-US')
         : data.rawPrice.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
       const sign = data.rawChange >= 0 ? '+' : '';
-      
+
       const historyStr = Object.entries(data.historyIntervals)
         .map(([time, change]) => `\`${time}: ${change}\``)
         .join(' | ');
@@ -1101,11 +1195,11 @@ async function sendInstantSummary() {
       p2pBuyText = `**${marketData.price} VND** (User: ${marketData.merchant})\n> ⚖ *Ad Range Limits:* ${formattedMin} - ${formattedMax} VND`;
     }
 
-    const sellPriceText = avgSellPrice 
-      ? `**${avgSellPrice.toLocaleString('en-US', { maximumFractionDigits: 2 })} VND** (Avg of top 5)` 
+    const sellPriceText = avgSellPrice
+      ? `**${avgSellPrice.toLocaleString('en-US', { maximumFractionDigits: 2 })} VND** (Avg of top 5)`
       : 'Data Unavailable';
 
-    const fngValue = fngData ? fngData.value : 50; 
+    const fngValue = fngData ? fngData.value : 50;
     const p2pPriceRaw = marketData ? Number(marketData.price) : null;
     const effectiveRate = liveUsdVndRate || IMPLIED_GLOBAL_USD_VND;
     const livePremium = p2pPriceRaw ? (((p2pPriceRaw / effectiveRate) - 1) * 100) : null;
@@ -1120,8 +1214,8 @@ async function sendInstantSummary() {
     const okxFallbackNotice = okxP2PData?.source === 'Marketplace'
       ? '⚠️ **OKX fallback active:** Marketplace endpoint used'
       : '';
-    const blackMarketUsdVnd = blackMarketRate ? blackMarketRate.toLocaleString('en-US', { maximumFractionDigits: 0 }) : null;
-    
+    const blackMarketUsdVnd = blackMarketRate ? blackMarketRate.sell.toLocaleString('en-US', { maximumFractionDigits: 0 }) : null;
+
     const advice = runDynamicQuantEngine(fngValue, p2pPriceRaw, btc, eth, bnb, sol, stablecoinParity, btcLongShortRatio, btcFundingRate, solFundingRate, liveUsdVndRate);
 
     // ==========================================
@@ -1140,9 +1234,9 @@ async function sendInstantSummary() {
 
     const getLSRatioIcon = (r) => {
       if (r === null) return '⚪';
-      if (r > 1.8 || r < 0.8) return '🔴'; 
+      if (r > 1.8 || r < 0.8) return '🔴';
       if (r >= 1.4 || r <= 1.0) return '🟡';
-      return '🟢'; 
+      return '🟢';
     };
 
     const getLongShortSentiment = (r) => {
@@ -1162,21 +1256,21 @@ async function sendInstantSummary() {
     const getFundingIcon = (f) => {
       if (f === null) return '⚪';
       const absFundingPercentage = Math.abs(f * 100);
-      if (absFundingPercentage > 0.04) return '🔴'; 
+      if (absFundingPercentage > 0.04) return '🔴';
       if (absFundingPercentage >= 0.01) return '🟡';
-      return '🟢'; 
+      return '🟢';
     };
 
     const getParityIcon = (p) => {
       if (!p) return '⚪';
       const deviation = Math.abs(p - 1.0);
-      if (deviation > 0.008) return '🔴'; 
+      if (deviation > 0.008) return '🔴';
       if (deviation >= 0.002) return '🟡';
-      return '🟢'; 
+      return '🟢';
     };
 
     const getFngIcon = (v) => {
-      if (v > 75 || v < 25) return '🔴'; 
+      if (v > 75 || v < 25) return '🔴';
       if (v >= 60 || v <= 40) return '🟡';
       return '🟢';
     };
@@ -1218,7 +1312,7 @@ async function sendInstantSummary() {
       `==============================`,
       `🪙 **GLOBAL SPOT MARKET INDEXES & VELOCITY**`,
       ...displays.flatMap(({ symbol, display }) => ([
-        `> ${display.indicator} **${symbol.replace('USDT','')}**: ${display.text}`,
+        `> ${display.indicator} **${symbol.replace('USDT', '')}**: ${display.text}`,
         `> ⏱️ ${display.intervals}`,
         `>`
       ])).slice(0, -1) // Drops the final trailing empty layout point
@@ -1244,7 +1338,7 @@ async function sendInstantSummary() {
     // Fire events sequentially to prevent Discord content interleaving issues
     await sendDiscordNotification(statisticMessage);
     await sendDiscordNotification(strategyMessage);
-    
+
     console.log(`[${new Date().toISOString()}] sendInstantSummary() split payload successfully dispatched.`);
   } catch (error) {
     console.error('❌ Failed to compile dynamic summary snapshot:', error.message);
@@ -1265,24 +1359,24 @@ async function sendDiscordNotification(messageText) {
 
   try {
     const ts = new Date().toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
-    
+
     // Sửa lỗi 1: Giới hạn ký tự an toàn dưới 2000
-    const maxChars = 1900; 
+    const maxChars = 1900;
     let safeText = String(messageText);
     if (safeText.length > maxChars) {
       safeText = safeText.slice(0, maxChars) + "\n...(Tin nhắn quá dài đã bị cắt bớt)...";
     }
 
     const payload = { content: `[${ts}]\n${safeText}` };
-    
-    console.log(`[${ts}] sendDiscordNotification -> dispatching (trunc): ${safeText.slice(0,120).replace(/\n/g,' ')}...`);
-    
+
+    console.log(`[${ts}] sendDiscordNotification -> dispatching (trunc): ${safeText.slice(0, 120).replace(/\n/g, ' ')}...`);
+
     // Sửa lỗi 3: Thêm Headers tường minh
-    const resp = await axios.post(DISCORD_WEBHOOK_URL, payload, { 
+    const resp = await axios.post(DISCORD_WEBHOOK_URL, payload, {
       timeout: 5000,
       headers: { 'Content-Type': 'application/json' }
     });
-    
+
     logApiCall('Discord Webhook', DISCORD_WEBHOOK_URL, `delivered, status=${resp.status}, chars=${safeText.length}`);
     console.log(`[${new Date().toISOString()}] sendDiscordNotification -> delivered, status: ${resp.status}`);
   } catch (error) {
@@ -1304,9 +1398,9 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, () => {
   console.log(`🚀 Server executing tracking workflows on port ${PORT}`);
-  
+
   monitorThreshold();
-  
+
   const monitorId = setInterval(monitorThreshold, MONITOR_INTERVAL_MS);
   const summaryId = setInterval(sendInstantSummary, SUMMARY_INTERVAL_MS);
 
