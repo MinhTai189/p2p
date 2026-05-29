@@ -1224,8 +1224,7 @@ async function sendInstantSummary() {
       : '';
     const blackMarketUsdVnd = blackMarketRate ? blackMarketRate.sell.toLocaleString('en-US', { maximumFractionDigits: 0 }) : null;
 
-    const advice = runDynamicQuantEngine(fngValue, p2pPriceRaw, btc, eth, bnb, sol, stablecoinParity, btcLongShortRatio, btcFundingRate, solFundingRate, liveUsdVndRate);
-
+    const advice = runDynamicQuantEngine(fngValue, p2pPriceRaw, btc, eth, bnb, sol, stablecoinParity, btcLongShortRatio, btcFundingRate, ethFundingRate, solFundingRate, liveUsdVndRate);
     // ==========================================
     // METRIC RISK-LEVEL ICON MAP HELPERS
     // 🔴 = High Danger/Anomalous Heat
