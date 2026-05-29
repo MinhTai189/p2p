@@ -307,8 +307,8 @@ function parseVndString(text) {
 async function fetchFromChoGia() {
   const url = 'https://chogia.vn/ngoai-te/usd-cho-den/';
   const { data } = await axios.get(url, {
-    headers: { 
-      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36' 
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
     },
     timeout: 7000
   });
@@ -347,7 +347,7 @@ async function fetchFromChoGia() {
   if (buy > 23000 && sell > 23000) {
     return { buy, sell, source: 'ChoGia Content Engine' };
   }
-  
+
   throw new Error('Could not resolve numeric price blocks from current layout');
 }
 
@@ -397,7 +397,7 @@ async function fetchBlackMarketExchangeRate(forceRefresh = false) {
     return { ...cache.data, cached: false };
   } catch (err) {
     console.warn(`⚠️ ChoGia engine extraction failed: ${err.message}. Routing to fallback...`);
-    
+
     try {
       const fallbackData = await fetchFromBackupSource();
       cache.data = fallbackData;
@@ -763,7 +763,7 @@ async function fetchSpotTickerData(symbol) {
  * DYNAMIC QUANT ENGINE
  * Generates programmatic strategies using asset velocity spreads & market premium ratios
  */
-function runDynamicQuantEngine(fngValue, currentP2PPrice, btc, eth, bnb, sol, stablecoinParity, btcLongShortRatio, btcFundingRate, solFundingRate, liveExchangeRate) {
+function runDynamicQuantEngine(fngValue, currentP2PPrice, btc, eth, bnb, sol, stablecoinParity, btcLongShortRatio, btcFundingRate, ethFundingRate, solFundingRate, liveExchangeRate) {
   const actions = [];
   const strategyNotes = [];
   let marketContext = "Stable Consolidation";
@@ -791,6 +791,12 @@ function runDynamicQuantEngine(fngValue, currentP2PPrice, btc, eth, bnb, sol, st
     actions.push(`🔥 **BTC Funding Rate:** ${(btcFundingRate * 100).toFixed(3)}% per 8h`);
     if (btcFundingRate > FUNDING_RATE_WARNING_THRESHOLD) {
       fundingWarnings.push(`BTC funding rate is elevated above ${(FUNDING_RATE_WARNING_THRESHOLD * 100).toFixed(3)}%. This suggests long-side leverage stress and a higher chance of liquidation cascades.`);
+    }
+  }
+  if (ethFundingRate !== null) {
+    actions.push(`🔥 **ETH Funding Rate:** ${(ethFundingRate * 100).toFixed(3)}% per 8h`);
+    if (ethFundingRate > FUNDING_RATE_WARNING_THRESHOLD) {
+      fundingWarnings.push(`ETH funding rate is elevated above ${(FUNDING_RATE_WARNING_THRESHOLD * 100).toFixed(3)}%. High perpetual funding signals risky long-side speculation.`);
     }
   }
   if (solFundingRate !== null) {
@@ -1133,6 +1139,7 @@ async function sendInstantSummary() {
       fetchTopLongShortPositionRatio('BTCUSDT'),
       fetchGlobalLongShortAccountRatio('BTCUSDT'),
       fetchFundingRate('BTCUSDT'),
+      fetchFundingRate('ETHUSDT'),
       fetchFundingRate('SOLUSDT'),
       fetchLiveExchangeRate(),
       fetchOkxP2PBuyMarketData(),
@@ -1148,10 +1155,11 @@ async function sendInstantSummary() {
     const btcTopPositionRatio = allResults[TRACKING_SYMBOLS.length + 4];
     const btcGlobalAccountRatio = allResults[TRACKING_SYMBOLS.length + 5];
     const btcFundingRate = allResults[TRACKING_SYMBOLS.length + 6];
-    const solFundingRate = allResults[TRACKING_SYMBOLS.length + 7];
-    const liveUsdVndRate = allResults[TRACKING_SYMBOLS.length + 8];
-    const okxP2PData = allResults[TRACKING_SYMBOLS.length + 9];
-    const blackMarketRate = allResults[TRACKING_SYMBOLS.length + 10];
+    const ethFundingRate = allResults[TRACKING_SYMBOLS.length + 7];
+    const solFundingRate = allResults[TRACKING_SYMBOLS.length + 8];
+    const liveUsdVndRate = allResults[TRACKING_SYMBOLS.length + 9];
+    const okxP2PData = allResults[TRACKING_SYMBOLS.length + 10];
+    const blackMarketRate = allResults[TRACKING_SYMBOLS.length + 11];
 
     // Map spot results by symbol for easy access
     const spotMap = {};
