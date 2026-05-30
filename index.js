@@ -45,7 +45,7 @@ const VCB_XML_URL = 'https://portal.vietcombank.com.vn/Usercontrols/TVPortal.TyG
 // Track downtrend warnings to avoid duplicate messages per day: key -> `${date}:${symbol}:${level}`
 const downtrendAlertTracker = new Set();
 // Symbols tracked by the bot for spot fetching and summary display (comma-separated env)
-const TRACKING_SYMBOLS = (process.env.TRACKING_SYMBOLS || 'BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT')
+const TRACKING_SYMBOLS = (process.env.TRACKING_SYMBOLS || 'BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XUAT')
   .split(',')
   .map(s => s.trim().toUpperCase())
   .filter(Boolean);
@@ -763,7 +763,7 @@ async function fetchSpotTickerData(symbol) {
  * DYNAMIC QUANT ENGINE
  * Generates programmatic strategies using asset velocity spreads & market premium ratios
  */
-function runDynamicQuantEngine(fngValue, currentP2PPrice, btc, eth, bnb, sol, stablecoinParity, btcLongShortRatio, btcFundingRate, ethFundingRate, solFundingRate, liveExchangeRate) {
+function runDynamicQuantEngine(fngValue, currentP2PPrice, btc, eth, bnb, sol, xuat, stablecoinParity, btcLongShortRatio, btcFundingRate, ethFundingRate, solFundingRate, xuatFundingRate, liveExchangeRate) {
   const actions = [];
   const strategyNotes = [];
   let marketContext = "Stable Consolidation";
@@ -803,6 +803,12 @@ function runDynamicQuantEngine(fngValue, currentP2PPrice, btc, eth, bnb, sol, st
     actions.push(`🔥 **SOL Funding Rate:** ${(solFundingRate * 100).toFixed(3)}% per 8h`);
     if (solFundingRate > FUNDING_RATE_WARNING_THRESHOLD) {
       fundingWarnings.push(`SOL funding rate is elevated above ${(FUNDING_RATE_WARNING_THRESHOLD * 100).toFixed(3)}%. High perpetual funding signals risky long-side speculation.`);
+    }
+  }
+  if (xuatFundingRate !== null) {
+    actions.push(`🔥 **XUAT Funding Rate:** ${(xuatFundingRate * 100).toFixed(3)}% per 8h`);
+    if (xuatFundingRate > FUNDING_RATE_WARNING_THRESHOLD) {
+      fundingWarnings.push(`XUAT funding rate is elevated above ${(FUNDING_RATE_WARNING_THRESHOLD * 100).toFixed(3)}%. High perpetual funding signals risky long-side speculation.`);
     }
   }
   if (fundingWarnings.length > 0) {
@@ -859,8 +865,13 @@ function runDynamicQuantEngine(fngValue, currentP2PPrice, btc, eth, bnb, sol, st
   if (btc && eth && sol) {
     const ethVsBtcSpread = eth.rawChange - btc.rawChange;
     const solVsBtcSpread = sol.rawChange - btc.rawChange;
+    const xuatVsBtcSpread = xuat ? xuat.rawChange - btc.rawChange : null;
 
-    if (solVsBtcSpread > 4.0) {
+    if (xuatVsBtcSpread !== null && xuatVsBtcSpread > 5.0) {
+      const dailyVolatility = ((xuat.highPrice - xuat.lowPrice) / xuat.lowPrice) * 100;
+      actions.push(`🔄 **XUAT SURGE:** XUAT is outperforming BTC by **${xuatVsBtcSpread.toFixed(2)}%** with a 24h trading spread volatility of **${dailyVolatility.toFixed(2)}%**. Strong momentum detected in XUAT ecosystem.`);
+      strategyNotes.push(`Consider rotating a portion of exposure into XUAT if tracking the momentum theme, but maintain strict position size discipline due to elevated volatility.`);
+    } else if (solVsBtcSpread > 4.0) {
       const dailyVolatility = ((sol.highPrice - sol.lowPrice) / sol.lowPrice) * 100;
       actions.push(`🔄 **SOLANA ALPHA ROTATION:** SOL is outperforming BTC by **${solVsBtcSpread.toFixed(2)}%** with a 24h trading spread volatility of **${dailyVolatility.toFixed(2)}%**. Market favor has aggressive capital rotation shifting toward the Solana ecosystem.`);
       strategyNotes.push(`Consider rotating a portion of exposure into SOL if you want to follow a strong momentum theme, but keep position size limited due to elevated volatility.`);
@@ -1141,6 +1152,7 @@ async function sendInstantSummary() {
       fetchFundingRate('BTCUSDT'),
       fetchFundingRate('ETHUSDT'),
       fetchFundingRate('SOLUSDT'),
+      fetchFundingRate('XUAT'),
       fetchLiveExchangeRate(),
       fetchOkxP2PBuyMarketData(),
       fetchBlackMarketExchangeRate()
@@ -1157,9 +1169,10 @@ async function sendInstantSummary() {
     const btcFundingRate = allResults[TRACKING_SYMBOLS.length + 6];
     const ethFundingRate = allResults[TRACKING_SYMBOLS.length + 7];
     const solFundingRate = allResults[TRACKING_SYMBOLS.length + 8];
-    const liveUsdVndRate = allResults[TRACKING_SYMBOLS.length + 9];
-    const okxP2PData = allResults[TRACKING_SYMBOLS.length + 10];
-    const blackMarketRate = allResults[TRACKING_SYMBOLS.length + 11];
+    const xuatFundingRate = allResults[TRACKING_SYMBOLS.length + 9];
+    const liveUsdVndRate = allResults[TRACKING_SYMBOLS.length + 10];
+    const okxP2PData = allResults[TRACKING_SYMBOLS.length + 11];
+    const blackMarketRate = allResults[TRACKING_SYMBOLS.length + 12];
 
     // Map spot results by symbol for easy access
     const spotMap = {};
@@ -1171,6 +1184,7 @@ async function sendInstantSummary() {
     const eth = spotMap['ETHUSDT'] || null;
     const bnb = spotMap['BNBUSDT'] || null;
     const sol = spotMap['SOLUSDT'] || null;
+    const xuat = spotMap['XUAT'] || null;
 
     const formatDisplay = (data, isBtc) => {
       if (!data) return { text: 'Fetch Error', indicator: '❌', intervals: '' };
@@ -1224,7 +1238,7 @@ async function sendInstantSummary() {
       : '';
     const blackMarketUsdVnd = blackMarketRate ? blackMarketRate.sell.toLocaleString('en-US', { maximumFractionDigits: 0 }) : null;
 
-    const advice = runDynamicQuantEngine(fngValue, p2pPriceRaw, btc, eth, bnb, sol, stablecoinParity, btcLongShortRatio, btcFundingRate, ethFundingRate, solFundingRate, liveUsdVndRate);
+    const advice = runDynamicQuantEngine(fngValue, p2pPriceRaw, btc, eth, bnb, sol, xuat, stablecoinParity, btcLongShortRatio, btcFundingRate, ethFundingRate, solFundingRate, xuatFundingRate, liveUsdVndRate);
     // ==========================================
     // METRIC RISK-LEVEL ICON MAP HELPERS
     // 🔴 = High Danger/Anomalous Heat
