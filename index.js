@@ -24,6 +24,7 @@ const MAX_HISTORY_WINDOW_MS = TRACKING_WINDOW_MIN * 60 * 1000;
 const BINANCE_P2P_URL = 'https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search';
 const FEAR_GREED_URL = 'https://api.alternative.me/fng/';
 const BINANCE_24HR_TICKER_URL = 'https://api.binance.com/api/v3/ticker/24hr';
+const BINANCE_FAPI_PRICE_URL = 'https://fapi.binance.com/fapi/v1/ticker/price';
 const BINANCE_STABLECOIN_PARITY_URL = 'https://api.binance.com/api/v3/ticker/price?symbol=USDCUSDT';
 const BINANCE_LONG_SHORT_RATIO_URL_BASE = 'https://fapi.binance.com/futures/data/topLongShortAccountRatio';
 const BINANCE_TAKER_LONG_SHORT_RATIO_URL = 'https://fapi.binance.com/futures/data/takerlongshortRatio';
@@ -724,6 +725,37 @@ function calculateIntervalChanges(history, currentPrice) {
  * Enhanced spot fetcher gathering high/low spreads alongside price changes
  */
 async function fetchSpotTickerData(symbol) {
+  // Special-case: IRYS does not expose a full 24hr ticker on the spot API in some environments.
+  // Use Binance FAPI price endpoint as a lightweight price fetch for IRYSUSDT.
+  if (symbol === 'IRYSUSDT') {
+    const fapiUrl = `${BINANCE_FAPI_PRICE_URL}?symbol=${symbol}`;
+    logApiCall('Binance FAPI Ticker Price', fapiUrl, `start, symbol=${symbol}`);
+    try {
+      const response = await axios.get(fapiUrl, { timeout: 5000 });
+      const price = parseFloat(response?.data?.price);
+      if (!Number.isFinite(price)) return null;
+
+      const now = Date.now();
+      if (!priceHistoryLog.has(symbol)) priceHistoryLog.set(symbol, []);
+      const history = priceHistoryLog.get(symbol);
+      history.push({ timestamp: now, price });
+
+      const boundaryTime = now - MAX_HISTORY_WINDOW_MS;
+      while (history.length > 0 && history[0].timestamp < boundaryTime) history.shift();
+
+      return {
+        rawPrice: price,
+        rawChange: 0,
+        highPrice: price,
+        lowPrice: price,
+        historyIntervals: calculateIntervalChanges(history, price)
+      };
+    } catch (error) {
+      console.error(`❌ Spot Ticker Error (FAPI ${symbol}):`, error.message);
+      return null;
+    }
+  }
+
   const url = `${BINANCE_24HR_TICKER_URL}?symbol=${symbol}`;
   logApiCall('Binance Spot Ticker', url, `start, symbol=${symbol}`);
   try {
@@ -731,7 +763,6 @@ async function fetchSpotTickerData(symbol) {
     if (response?.data) {
       const currentPrice = parseFloat(response.data.lastPrice);
       const now = Date.now();
-
 
       if (!priceHistoryLog.has(symbol)) {
         priceHistoryLog.set(symbol, []);
