@@ -65,6 +65,9 @@ const MAX_ALERTS_PER_AD = 3;
 
 // Tracker to prevent FnG alert spamming (tracks alerts by date + index value)
 const fngAlertTracker = new Set();
+// Counter to allow up to a small number of critical FNG notifications per day
+const fngAlertCounter = new Map();
+const MAX_DAILY_FNG_ALERTS = Number(process.env.MAX_DAILY_FNG_ALERTS) || 2; // default allow 2 sends/day
 
 // Gating state to prevent rate-limiting on the daily-updating FnG API endpoint
 let lastFngFetchDate = '';
@@ -1028,6 +1031,17 @@ function purgeOldCacheTrackingRecords() {
       fngAlertTracker.delete(trackingArray[i]);
     }
   }
+  // Prune old FNG counters so the map stays small and only contains today's keys
+  try {
+    const todayUtc = new Date().toISOString().split('T')[0];
+    for (const key of Array.from(fngAlertCounter.keys())) {
+      if (!key.startsWith(todayUtc)) {
+        fngAlertCounter.delete(key);
+      }
+    }
+  } catch (e) {
+    // noop
+  }
 }
 
 /**
@@ -1041,9 +1055,13 @@ async function monitorThreshold() {
       const fngValue = fngData.value;
       const todayUtc = new Date().toISOString().split('T')[0];
       const fngDailyKey = `${todayUtc}:${fngValue}`;
+      const fngCountKey = `${todayUtc}:CRITICAL_FNG`;
+      const currentFngCount = fngAlertCounter.get(fngCountKey) || 0;
 
-      if (fngValue < 25 && !fngAlertTracker.has(fngDailyKey)) {
+      if (fngValue < 25 && currentFngCount < MAX_DAILY_FNG_ALERTS) {
+        // Track per-value dedupe as before and increment the daily counter
         fngAlertTracker.add(fngDailyKey);
+        fngAlertCounter.set(fngCountKey, currentFngCount + 1);
 
         // GATED: Only broadcast to Discord if outside quiet VN hour bands
         if (!isVnQuietHours()) {
