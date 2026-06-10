@@ -33,6 +33,8 @@ const BINANCE_GLOBAL_LONG_SHORT_ACCOUNT_RATIO_URL = 'https://fapi.binance.com/fu
 const BINANCE_PREMIUM_INDEX_URL = 'https://fapi.binance.com/fapi/v1/premiumIndex';
 const BINANCE_KLINES_URL = 'https://api.binance.com/api/v3/klines';
 const LIVE_EXCHANGE_RATE_URL = 'https://open.er-api.com/v6/latest/USD';
+const COINGECKO_COINS_LIST_URL = 'https://api.coingecko.com/api/v3/coins/list';
+const COINGECKO_SIMPLE_PRICE_URL = 'https://api.coingecko.com/api/v3/simple/price';
 const OKX_P2P_BASE_URL = 'https://www.okx.com/v3/c2c';
 const OKX_P2P_BOOKS_URL = `${OKX_P2P_BASE_URL}/tradingOrders/books`;
 const OKX_P2P_MARKETPLACE_URL = `${OKX_P2P_BASE_URL}/tradingOrders/getMarketplaceAdsPrelogin`;
@@ -71,6 +73,13 @@ let cachedFngData = null;
 const cache = {
   data: null,
   expiresAt: 0
+};
+
+// CoinGecko coin list cache (symbol -> id mapping)
+const coinGeckoMap = {
+  lastFetched: 0,
+  ttl: 24 * 60 * 60 * 1000, // refresh once per day
+  map: new Map()
 };
 
 // Configurable Cache Duration: 8 hours (8 * 60 * 1000 ms * 60)
@@ -188,6 +197,68 @@ function extractNumericRate(payload, depth = 0) {
     }
   }
   return null;
+}
+
+async function refreshCoinGeckoMapIfNeeded() {
+  const now = Date.now();
+  if (coinGeckoMap.map.size > 0 && (now - coinGeckoMap.lastFetched) < coinGeckoMap.ttl) return;
+  try {
+    const resp = await axios.get(COINGECKO_COINS_LIST_URL, { timeout: 10000 });
+    if (Array.isArray(resp.data)) {
+      coinGeckoMap.map.clear();
+      for (const item of resp.data) {
+        if (!item || !item.id || !item.symbol) continue;
+        const key = item.symbol.trim().toLowerCase();
+        if (!coinGeckoMap.map.has(key)) coinGeckoMap.map.set(key, item.id);
+      }
+      coinGeckoMap.lastFetched = now;
+      console.log(`✅ CoinGecko coin list cached (${coinGeckoMap.map.size} entries).`);
+    }
+  } catch (err) {
+    console.warn('⚠️ Failed to refresh CoinGecko coin list:', err.message);
+  }
+}
+
+async function getCoinGeckoIdForSymbol(symbol) {
+  if (!symbol) return null;
+  await refreshCoinGeckoMapIfNeeded();
+  // symbol may be like 'OKBUSDT' or 'IRYSUSDT' -> strip USDT suffix
+  const cleaned = symbol.replace(/USDT$/i, '').trim().toLowerCase();
+  return coinGeckoMap.map.get(cleaned) || null;
+}
+
+async function fetchPriceFromCoinGeckoBySymbol(symbol) {
+  const id = await getCoinGeckoIdForSymbol(symbol);
+  if (!id) return null;
+  try {
+    const resp = await axios.get(COINGECKO_SIMPLE_PRICE_URL, {
+      timeout: 8000,
+      params: { ids: id, vs_currencies: 'usd', include_24hr_change: 'true' }
+    });
+    const obj = resp.data && resp.data[id];
+    if (!obj || !obj.usd) return null;
+    const price = Number(obj.usd);
+    const changePct = obj.usd_24h_change ? Number(obj.usd_24h_change) : 0;
+
+    const now = Date.now();
+    const symbolKey = symbol.toUpperCase();
+    if (!priceHistoryLog.has(symbolKey)) priceHistoryLog.set(symbolKey, []);
+    const history = priceHistoryLog.get(symbolKey);
+    history.push({ timestamp: now, price });
+    const boundaryTime = now - MAX_HISTORY_WINDOW_MS;
+    while (history.length > 0 && history[0].timestamp < boundaryTime) history.shift();
+
+    return {
+      rawPrice: price,
+      rawChange: changePct || 0,
+      highPrice: price,
+      lowPrice: price,
+      historyIntervals: calculateIntervalChanges(history, price)
+    };
+  } catch (err) {
+    console.warn(`⚠️ CoinGecko price fetch failed for ${symbol}:`, err.message);
+    return null;
+  }
 }
 
 async function fetchOkxP2PAdsFromMarketplace(tradeType = 'BUY') {
@@ -752,6 +823,9 @@ async function fetchSpotTickerData(symbol) {
       };
     } catch (error) {
       console.error(`❌ Spot Ticker Error (FAPI ${symbol}):`, error.message);
+      // Attempt CoinGecko fallback for small tokens
+      const fallback = await fetchPriceFromCoinGeckoBySymbol(symbol);
+      if (fallback) return fallback;
       return null;
     }
   }
@@ -786,6 +860,12 @@ async function fetchSpotTickerData(symbol) {
     return null;
   } catch (error) {
     console.error(`❌ Spot Ticker Error (${symbol}):`, error.message);
+    // If Binance replies with invalid symbol or 400, attempt CoinGecko fallback
+    const isInvalidSymbol = error.response && (error.response.status === 400 || error.response?.data?.code === -1121);
+    if (isInvalidSymbol) {
+      const fallback = await fetchPriceFromCoinGeckoBySymbol(symbol);
+      if (fallback) return fallback;
+    }
     return null;
   }
 }
