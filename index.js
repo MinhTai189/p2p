@@ -1327,7 +1327,7 @@ async function sendInstantSummary() {
       if (!data) return { text: 'Fetch Error', indicator: '❌', intervals: '', ratioText: 'L/S: N/A' };
       const formattedPrice = isBtc
         ? Math.floor(data.rawPrice).toLocaleString('en-US')
-        : data.rawPrice.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        : data.rawPrice.toLocaleString('en-US', { minimumFractionDigits: 4, maximumFractionDigits: 4 });
       const sign = data.rawChange >= 0 ? '+' : '';
 
       const historyStr = Object.entries(data.historyIntervals)
